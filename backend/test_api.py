@@ -7,7 +7,7 @@ os.environ["DATABASE_PATH"] = tempfile.NamedTemporaryFile(delete=False).name
 import pytest
 from fastapi.testclient import TestClient
 
-from main import DATABASE_PATH, app, init_db
+from main import DATABASE_PATH, app, get_connection, init_db
 
 
 client = TestClient(app)
@@ -19,7 +19,22 @@ def reset_test_database():
     if path.exists():
         path.unlink()
     init_db()
+    authenticated = client.post(
+        "/api/v1/auth/register",
+        json={
+            "name": "测试用户", "phone": "13900000000",
+            "organization": "测试单位", "role": "sender", "password": "test-password",
+        },
+    )
+    session = authenticated.json()["data"]
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE task_handoff SET owner_user_id = ? WHERE task_id = 'TASK-001'",
+            (session["user"]["id"],),
+        )
+    client.headers["Authorization"] = f"Bearer {session['token']}"
     yield
+    client.headers.pop("Authorization", None)
 
 
 def test_post_latest_history_and_events():
@@ -68,6 +83,87 @@ def test_post_latest_history_and_events():
     events = client.get("/api/device/events")
     assert events.status_code == 200
     assert events.json()[0]["event_type"] == "SEVERE"
+
+
+def test_register_login_me_and_logout():
+    account = {
+        "name": "张敏",
+        "phone": "13800138000",
+        "organization": "高校实验室",
+        "role": "sender",
+        "password": "coldchain123",
+    }
+    registered = client.post("/api/v1/auth/register", json=account)
+    assert registered.status_code == 200
+    session = registered.json()["data"]
+    assert session["user"]["phone"] == account["phone"]
+    assert session["user"]["role"] == "sender"
+    assert "password_hash" not in session["user"]
+
+    duplicate = client.post("/api/v1/auth/register", json=account)
+    assert duplicate.status_code == 409
+
+    bad_login = client.post(
+        "/api/v1/auth/login",
+        json={"phone": account["phone"], "password": "wrong-password"},
+    )
+    assert bad_login.status_code == 401
+
+    logged_in = client.post(
+        "/api/v1/auth/login",
+        json={"phone": account["phone"], "password": account["password"]},
+    )
+    assert logged_in.status_code == 200
+    token = logged_in.json()["data"]["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    current = client.get("/api/v1/auth/me", headers=headers)
+    assert current.status_code == 200
+    assert current.json()["data"]["organization"] == account["organization"]
+
+    logged_out = client.post("/api/v1/auth/logout", headers=headers)
+    assert logged_out.status_code == 200
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
+
+
+def test_new_account_starts_empty_and_created_task_is_private():
+    second = client.post(
+        "/api/v1/auth/register",
+        json={
+            "name": "新发货人", "phone": "13700000000",
+            "organization": "新实验室", "role": "sender", "password": "test-password",
+        },
+    ).json()["data"]
+    second_headers = {"Authorization": f"Bearer {second['token']}"}
+
+    empty = client.get("/api/v1/tasks", headers=second_headers)
+    assert empty.status_code == 200
+    assert empty.json()["data"] == []
+
+    created = client.post(
+        "/api/v1/tasks",
+        headers=second_headers,
+        json={
+            "sample_name": "血液样本批次 B",
+            "batch": "B-002",
+            "receiver": "市医院检验科",
+            "carrier": "迅达冷链",
+            "expected_arrival": "2026-07-23 10:00",
+            "device_id": "CLD-009",
+            "box_id": "BOX-009",
+            "seal_id": "SEAL-009",
+            "temperature_range": "2 ~ 8℃",
+        },
+    )
+    assert created.status_code == 200
+    task = created.json()["data"]
+    assert task["task_id"].startswith("WD-")
+    assert task["sender"] == "新实验室"
+    assert task["owner_user_id"] == second["user"]["id"]
+
+    own_list = client.get("/api/v1/tasks", headers=second_headers).json()["data"]
+    assert [item["task_id"] for item in own_list] == [task["task_id"]]
+    assert client.get(f"/api/v1/tasks/{task['task_id']}").status_code == 404
 
 
 def test_task_handoff_and_report():

@@ -1,5 +1,5 @@
 import { appConfig } from '@/config/env'
-import type { AlarmEvent, ContractMeta, PagedResult, Task, Telemetry, TraceReport } from '@/types/api'
+import type { AlarmEvent, ContractMeta, CreateTaskInput, PagedResult, Task, Telemetry, TraceReport } from '@/types/api'
 import {
   mockAlarms, mockContracts, mockGetTask, mockHistory, mockLatest, mockReject,
   mockReport, mockSign, mockStart,
@@ -7,6 +7,8 @@ import {
 import { request } from './request'
 
 export const taskService = {
+  listTasks: () => appConfig.useMock ? Promise.all(appConfig.demoTaskIds.map(mockGetTask)) : request<Task[]>('/api/v1/tasks'),
+  createTask: (input: CreateTaskInput) => request<Task>('/api/v1/tasks', { method: 'POST', data: input }),
   getContracts: () => appConfig.useMock ? mockContracts() : request<ContractMeta>('/api/v1/meta/contracts'),
   getTask: (taskId: string) => appConfig.useMock ? mockGetTask(taskId) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}`),
   getLatestTelemetry: (taskId: string) => appConfig.useMock ? mockLatest(taskId) : request<Telemetry | null>(`/api/v1/tasks/${encodeURIComponent(taskId)}/telemetry/latest`),
@@ -16,8 +18,4 @@ export const taskService = {
   startTask: (taskId: string) => appConfig.useMock ? mockStart(taskId) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/start`, { method: 'POST' }),
   signTask: (taskId: string) => appConfig.useMock ? mockSign(taskId) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/sign`, { method: 'POST' }),
   rejectTask: (taskId: string, reason: string) => appConfig.useMock ? mockReject(taskId, reason) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/reject`, { method: 'POST', data: { reason } }),
-  async listDemoTasks() {
-    const results = await Promise.allSettled(appConfig.demoTaskIds.map((id) => this.getTask(id)))
-    return results.filter((item): item is PromiseFulfilledResult<Task> => item.status === 'fulfilled').map((item) => item.value)
-  },
 }

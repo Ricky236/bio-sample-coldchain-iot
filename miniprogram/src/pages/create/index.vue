@@ -1,30 +1,54 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { onLoad } from '@dcloudio/uni-app'
+import { taskService } from '@/services/tasks'
+import { errorMessage } from '@/services/request'
+import { useSessionStore } from '@/stores/session'
 
-const waybillNo = ref('WD-20260722-001')
-const sampleName = ref('生物样本批次A')
-const batch = ref('B20260722')
+const session = useSessionStore()
+const waybillNo = ref('提交后由后端自动生成')
+const sampleName = ref('')
+const batch = ref('')
 const range = ref('2 ~ 8℃')
-const sender = ref('高校实验室')
-const receiver = ref('医院检验科')
-const carrier = ref('李强')
-const arrival = ref('2026-07-23 10:00')
-const device = ref('CLD-001')
-const box = ref('BOX-A12')
-const seal = ref('SEAL-8891')
+const sender = ref('')
+const receiver = ref('')
+const carrier = ref('')
+const arrival = ref('')
+const device = ref('')
+const box = ref('')
+const seal = ref('')
 const saved = ref(false)
+const submitting = ref(false)
 const precheckOK = computed(() => Boolean(device.value && box.value && seal.value))
 
 function scanDevice() {
   uni.scanCode({ success: ({ result }) => { device.value = result || device.value }, fail: () => uni.showToast({ title: '演示模式：已保留 CLD-001', icon: 'none' }) })
 }
 function saveDraft() { saved.value = true; uni.showToast({ title: '草稿已保存', icon: 'success' }) }
-function complete() {
-  if (!sampleName.value.trim() || !precheckOK.value) return uni.showToast({ title: '请补全运单和设备信息', icon: 'none' })
-  uni.showModal({ title: '预检通过', content: `运单 ${waybillNo.value} 已完成建档、设备绑定和首条预检。`, showCancel: false, success: () => uni.navigateBack() })
+async function complete() {
+  if (!sampleName.value.trim() || !receiver.value.trim() || !precheckOK.value) return uni.showToast({ title: '请补全样本、收货方和设备信息', icon: 'none' })
+  submitting.value = true
+  try {
+    const task = await taskService.createTask({
+      sample_name: sampleName.value.trim(), batch: batch.value.trim(), receiver: receiver.value.trim(),
+      carrier: carrier.value.trim(), expected_arrival: arrival.value.trim(), device_id: device.value.trim(),
+      box_id: box.value.trim(), seal_id: seal.value.trim(), temperature_range: range.value.trim(),
+    })
+    waybillNo.value = task.task_id
+    uni.showModal({
+      title: '运单创建成功', content: `固定运单号：${task.task_id}\n设备：${task.device_id}`,
+      showCancel: false, success: () => uni.navigateBack(),
+    })
+  } catch (error) { uni.showToast({ title: errorMessage(error), icon: 'none', duration: 2500 }) }
+  finally { submitting.value = false }
 }
-onLoad(() => { waybillNo.value = `WD-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-001` })
+onLoad(() => {
+  if (!session.requireSession()) return
+  if (session.user?.role !== 'sender' && session.user?.role !== 'admin') {
+    uni.showToast({ title: '只有发货方可以创建运单', icon: 'none' }); setTimeout(() => uni.navigateBack(), 500); return
+  }
+  sender.value = session.user.organization
+})
 </script>
 
 <template>
@@ -35,7 +59,7 @@ onLoad(() => { waybillNo.value = `WD-${new Date().toISOString().slice(0,10).repl
       <view class="field"><label>样本名称</label><input v-model="sampleName" /></view>
       <view class="field"><label>批次</label><input v-model="batch" /></view>
       <view class="field"><label>温控范围</label><input v-model="range" /></view>
-      <view class="field"><label>发货单位</label><input v-model="sender" /></view>
+      <view class="field"><label>发货单位</label><input v-model="sender" disabled /></view>
       <view class="field"><label>收货单位</label><input v-model="receiver" /></view>
       <view class="field"><label>承运人</label><input v-model="carrier" /></view>
       <view class="field"><label>预计送达</label><input v-model="arrival" /></view>
@@ -51,7 +75,7 @@ onLoad(() => { waybillNo.value = `WD-${new Date().toISOString().slice(0,10).repl
       <view class="ok-note">✓ 设备运行正常，温湿度在可控范围内，可进行下一步交接。</view>
       <view class="warn-note">▲ 若温湿度超出范围，请检查设备与箱体密封后重新预检。</view>
     </view>
-    <view class="actions"><button class="draft" @tap="saveDraft">▤ {{ saved ? '已存草稿' : '存草稿' }}</button><button class="complete" @tap="complete">✓ 完成预检并待交接</button></view>
+    <view class="actions"><button class="draft" @tap="saveDraft">▤ {{ saved ? '已存草稿' : '存草稿' }}</button><button class="complete" :disabled="submitting" @tap="complete">{{ submitting ? '正在创建…' : '✓ 完成预检并创建运单' }}</button></view>
   </view>
 </template>
 

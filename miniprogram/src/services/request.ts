@@ -14,7 +14,10 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     const response = await uni.request({
       url: `${appConfig.apiBaseUrl}${path}`,
       method: options.method || 'GET', data: options.data, timeout: 10000,
-      header: { 'content-type': 'application/json' },
+      header: {
+        'content-type': 'application/json',
+        ...(uni.getStorageSync('coldchain_auth_session_v2')?.token ? { authorization: `Bearer ${uni.getStorageSync('coldchain_auth_session_v2').token}` } : {}),
+      },
     })
     const body = response.data as ApiResponse<T> | { detail?: unknown }
     if (response.statusCode < 200 || response.statusCode >= 300) {

@@ -1,92 +1,102 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { useSessionStore, type DemoUser } from '@/stores/session'
+import { computed, reactive, ref } from 'vue'
+import { onLoad } from '@dcloudio/uni-app'
+import { appConfig } from '@/config/env'
+import { authService } from '@/services/auth'
+import { errorMessage } from '@/services/request'
+import { useSessionStore } from '@/stores/session'
+import type { RegisterInput } from '@/types/api'
 
 const session = useSessionStore()
-const identities: Array<DemoUser & { code: string; description: string; tone: string }> = [
-  { name: '发出方', role: 'sender', code: '发', description: '核对并发出', tone: 'purple' },
-  { name: '承运方', role: 'carrier', code: '运', description: '运输与设备', tone: 'blue' },
-  { name: '接收方', role: 'receiver', code: '收', description: '到达与接收', tone: 'green' },
-  { name: '管理员', role: 'admin', code: '管', description: '完整演示数据', tone: 'orange' },
-]
+const mode = ref<'login' | 'register'>('login')
+const submitting = ref(false)
+const agreed = ref(false)
+const showPassword = ref(false)
+const loginForm = reactive({ phone: '', password: '' })
+const registerForm = reactive<RegisterInput & { confirmPassword: string }>({
+  name: '', phone: '', organization: '', role: 'sender', password: '', confirmPassword: '',
+})
+const roles = [
+  { value: 'sender', label: '发货单位', desc: '创建运单与装箱预检' },
+  { value: 'carrier', label: '承运人员', desc: '接收交接与运输监控' },
+  { value: 'receiver', label: '收货单位', desc: '到货验收与质量复核' },
+] as const
+const title = computed(() => mode.value === 'login' ? '欢迎登录' : '创建账户')
 
-onMounted(() => {
+onLoad(() => {
   session.restore()
   if (session.user) uni.reLaunch({ url: '/pages/tasks/index' })
 })
-
-function choose(user: DemoUser) {
-  session.selectIdentity(user)
-  uni.reLaunch({ url: '/pages/tasks/index' })
+function switchMode(next: 'login' | 'register') {
+  mode.value = next; agreed.value = false
+}
+function validPhone(phone: string) { return /^1\d{10}$/.test(phone.replace(/\s/g, '')) }
+function forgotPassword() { uni.showToast({ title: '请联系系统管理员重置密码', icon: 'none' }) }
+function validate() {
+  if (mode.value === 'login') {
+    if (!validPhone(loginForm.phone)) return '请输入正确的11位手机号'
+    if (loginForm.password.length < 6) return '密码至少需要6位'
+  } else {
+    if (!registerForm.name.trim()) return '请输入真实姓名'
+    if (!validPhone(registerForm.phone)) return '请输入正确的11位手机号'
+    if (!registerForm.organization.trim()) return '请输入所属单位'
+    if (registerForm.password.length < 6) return '密码至少需要6位'
+    if (registerForm.password !== registerForm.confirmPassword) return '两次输入的密码不一致'
+  }
+  if (!agreed.value) return '请阅读并同意用户协议和隐私政策'
+  return ''
+}
+async function submit() {
+  const message = validate()
+  if (message) return uni.showToast({ title: message, icon: 'none' })
+  submitting.value = true
+  try {
+    const result = mode.value === 'login'
+      ? await authService.login(loginForm)
+      : await authService.register({
+        name: registerForm.name, phone: registerForm.phone, organization: registerForm.organization,
+        role: registerForm.role, password: registerForm.password,
+      })
+    session.setSession(result)
+    uni.showToast({ title: mode.value === 'login' ? '登录成功' : '注册成功', icon: 'success' })
+    setTimeout(() => uni.reLaunch({ url: '/pages/tasks/index' }), 400)
+  } catch (error) { uni.showToast({ title: errorMessage(error), icon: 'none', duration: 2500 }) }
+  finally { submitting.value = false }
 }
 </script>
 
 <template>
-  <view class="page login-page">
-    <view class="glow glow-left" />
-    <view class="glow glow-right" />
+  <view class="auth-page">
+    <view class="orb orb-one"/><view class="orb orb-two"/>
+    <view class="brand"><view class="brand-icon">冷</view><view><b>BIO COLD CHAIN</b><text>可信冷链责任追溯</text></view></view>
+    <view class="welcome"><text>SECURE ACCESS</text><view>{{ title }}<i>.</i></view><p>{{ mode === 'login' ? '登录后，系统将根据账户权限进入工作台' : '完成实名认证信息，建立您的责任主体账户' }}</p></view>
 
-    <view class="brand-row">
-      <view class="brand">
-        <view class="brand-icon"><text>冷</text><view class="spark spark-one" /><view class="spark spark-two" /></view>
-        <view><view class="brand-name">BIO COLD CHAIN</view><view class="brand-cn">可信冷链</view></view>
-      </view>
-      <view class="mvp-badge"><view class="live-dot" />MVP 演示</view>
+    <view class="auth-card">
+      <view class="tabs"><view :class="{ active: mode === 'login' }" @tap="switchMode('login')">登录</view><view :class="{ active: mode === 'register' }" @tap="switchMode('register')">注册</view></view>
+
+      <template v-if="mode === 'login'">
+        <view class="field"><label>手机号码</label><view class="input-wrap"><text>+86</text><input v-model="loginForm.phone" type="number" maxlength="11" placeholder="请输入注册手机号" /></view></view>
+        <view class="field"><label>登录密码</label><view class="input-wrap"><text>●</text><input v-model="loginForm.password" :password="!showPassword" maxlength="32" placeholder="请输入登录密码" /><b @tap="showPassword = !showPassword">{{ showPassword ? '隐藏' : '显示' }}</b></view></view>
+        <view class="helper"><text>账号由个人注册获得</text><text @tap="forgotPassword">忘记密码？</text></view>
+      </template>
+
+      <template v-else>
+        <view class="form-grid"><view class="field"><label>姓名</label><view class="input-wrap"><input v-model="registerForm.name" maxlength="20" placeholder="请输入真实姓名" /></view></view><view class="field"><label>手机号码</label><view class="input-wrap"><input v-model="registerForm.phone" type="number" maxlength="11" placeholder="用于登录和身份核验" /></view></view></view>
+        <view class="field"><label>所属单位</label><view class="input-wrap"><input v-model="registerForm.organization" maxlength="40" placeholder="例如：高校实验室 / 冷链物流公司" /></view></view>
+        <view class="field"><label>账户角色</label><view class="role-list"><view v-for="item in roles" :key="item.value" :class="{ selected: registerForm.role === item.value }" @tap="registerForm.role = item.value"><b>{{ item.label }}</b><text>{{ item.desc }}</text><i>{{ registerForm.role === item.value ? '✓' : '' }}</i></view></view></view>
+        <view class="form-grid"><view class="field"><label>设置密码</label><view class="input-wrap"><input v-model="registerForm.password" password maxlength="32" placeholder="至少6位" /></view></view><view class="field"><label>确认密码</label><view class="input-wrap"><input v-model="registerForm.confirmPassword" password maxlength="32" placeholder="再次输入" /></view></view></view>
+      </template>
+
+      <view class="agreement" @tap="agreed = !agreed"><view :class="{ checked: agreed }">{{ agreed ? '✓' : '' }}</view><text>我已阅读并同意《用户协议》和《隐私政策》</text></view>
+      <button class="submit" :disabled="submitting" @tap="submit">{{ submitting ? '正在处理…' : mode === 'login' ? '安全登录' : '注册并登录' }}</button>
+      <view class="switch-tip" @tap="switchMode(mode === 'login' ? 'register' : 'login')">{{ mode === 'login' ? '还没有账号？立即注册' : '已有账号？返回登录' }}</view>
     </view>
 
-    <view class="hero-copy">
-      <view class="eyebrow">WELCOME BACK</view>
-      <view class="hero-title">让样本安全抵达<text class="title-dot">.</text></view>
-      <view class="hero-subtitle">选择身份，进入新版冷链责任追溯工作台</view>
-    </view>
-
-    <view class="visual-card">
-      <view class="visual-grid" />
-      <view class="route-path"><view class="path-progress" /><view class="moving-point" /></view>
-      <view class="station station-start"><view class="station-icon">发</view><text>样本发出</text></view>
-      <view class="station station-end"><view class="station-icon">收</view><text>安全送达</text></view>
-      <view class="cold-package">
-        <view class="package-handle" />
-        <view class="package-lid" />
-        <view class="package-body"><view class="cross">+</view><view class="temp">2–8℃</view></view>
-      </view>
-      <view class="visual-caption"><text>全程温控</text><text>可信追溯</text></view>
-    </view>
-
-    <view class="identity-panel">
-      <view class="panel-heading">
-        <view><view class="panel-title">选择演示身份</view><view class="panel-subtitle">进入对应任务工作台</view></view>
-        <view class="step-number">01</view>
-      </view>
-
-      <view class="identity-grid">
-        <view v-for="item in identities" :key="item.role" class="identity-card" @tap="choose(item)">
-          <view class="identity-icon" :class="item.tone">{{ item.code }}</view>
-          <view class="identity-name">{{ item.name }}</view>
-          <view class="identity-description">{{ item.description }}</view>
-          <view class="identity-arrow">↗</view>
-        </view>
-      </view>
-    </view>
-
-    <view class="trust-row">
-      <view class="trust-item"><view class="trust-icon">温</view><text>实时温控</text></view>
-      <view class="trust-divider" />
-      <view class="trust-item"><view class="trust-icon">交</view><text>电子交接</text></view>
-      <view class="trust-divider" />
-      <view class="trust-item"><view class="trust-icon">溯</view><text>全程追溯</text></view>
-    </view>
-
-    <view class="security-note"><view class="security-dot" /><text>仅使用虚构身份与样本数据</text></view>
+    <view class="security"><view>♢</view><text>账户角色由注册信息决定，所有登录与操作均留痕</text></view>
+    <view v-if="appConfig.useMock" class="dev-note">当前为离线开发模式 · 账户仅保存在本机</view>
   </view>
 </template>
 
 <style scoped>
-.login-page { position: relative; overflow: hidden; padding: 34rpx 30rpx 28rpx; background: linear-gradient(180deg, #eef3ff 0, #f7f8fc 48%, #f4f7fb 100%); }.glow { position: absolute; border-radius: 50%; filter: blur(4rpx); pointer-events: none; }.glow-left { left: -170rpx; top: 180rpx; width: 400rpx; height: 400rpx; background: rgba(183,176,255,.17); }.glow-right { right: -160rpx; top: -100rpx; width: 360rpx; height: 360rpx; background: rgba(142,184,255,.18); }
-.brand-row { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; }.brand { display: flex; align-items: center; gap: 16rpx; }.brand-icon { position: relative; display: flex; align-items: center; justify-content: center; width: 68rpx; height: 68rpx; border-radius: 21rpx; color: #fff; background: linear-gradient(145deg, #786aff, #5146f6); box-shadow: 0 10rpx 24rpx rgba(91,77,247,.25); font-size: 27rpx; font-weight: 750; }.spark { position: absolute; width: 6rpx; height: 6rpx; border-radius: 50%; background: rgba(255,255,255,.8); }.spark-one { left: 13rpx; top: 13rpx; }.spark-two { right: 12rpx; bottom: 14rpx; }.brand-name { color: #6558ff; font-size: 18rpx; font-weight: 800; letter-spacing: 3rpx; }.brand-cn { margin-top: 4rpx; color: #53677e; font-size: 21rpx; font-weight: 650; }.mvp-badge { display: flex; align-items: center; gap: 9rpx; padding: 10rpx 16rpx; border: 1rpx solid rgba(255,255,255,.9); border-radius: 999rpx; color: #77879b; background: rgba(255,255,255,.62); font-size: 19rpx; }.live-dot { width: 10rpx; height: 10rpx; border-radius: 50%; background: #5ac394; box-shadow: 0 0 0 5rpx rgba(90,195,148,.13); }
-.hero-copy { position: relative; z-index: 1; padding: 50rpx 4rpx 28rpx; }.eyebrow { margin-bottom: 12rpx; color: #8a7fff; font-size: 19rpx; font-weight: 750; letter-spacing: 5rpx; }.hero-title { color: #102a43; font-size: 48rpx; font-weight: 850; line-height: 1.28; }.title-dot { color: #6558ff; }.hero-subtitle { margin-top: 12rpx; color: #8797aa; font-size: 25rpx; }
-.visual-card { position: relative; z-index: 1; height: 242rpx; overflow: hidden; border: 1rpx solid rgba(255,255,255,.8); border-radius: 30rpx; background: linear-gradient(135deg, #7567ff 0%, #5c64e9 52%, #508fd7 100%); box-shadow: 0 18rpx 38rpx rgba(77,79,183,.22); }.visual-grid { position: absolute; inset: 0; opacity: .14; background-image: linear-gradient(rgba(255,255,255,.5) 1rpx, transparent 1rpx), linear-gradient(90deg, rgba(255,255,255,.5) 1rpx, transparent 1rpx); background-size: 52rpx 52rpx; }.route-path { position: absolute; left: 84rpx; right: 84rpx; top: 84rpx; height: 4rpx; border-radius: 4rpx; background: rgba(255,255,255,.28); }.path-progress { width: 58%; height: 100%; border-radius: 4rpx; background: #fff; }.moving-point { position: absolute; left: 56%; top: -8rpx; width: 20rpx; height: 20rpx; border: 5rpx solid rgba(255,255,255,.35); border-radius: 50%; background: #fff; box-shadow: 0 0 0 7rpx rgba(255,255,255,.12); }.station { position: absolute; top: 52rpx; display: flex; flex-direction: column; align-items: center; gap: 8rpx; color: rgba(255,255,255,.76); font-size: 18rpx; }.station-start { left: 30rpx; }.station-end { right: 30rpx; }.station-icon { display: flex; align-items: center; justify-content: center; width: 48rpx; height: 48rpx; border: 3rpx solid rgba(255,255,255,.6); border-radius: 50%; color: #fff; background: rgba(255,255,255,.13); font-size: 18rpx; font-weight: 750; }.cold-package { position: absolute; left: 50%; bottom: 30rpx; width: 132rpx; height: 112rpx; transform: translateX(-50%); }.package-handle { position: absolute; left: 41rpx; top: 0; width: 50rpx; height: 28rpx; border: 9rpx solid rgba(255,255,255,.9); border-bottom: 0; border-radius: 17rpx 17rpx 0 0; box-sizing: border-box; }.package-lid { position: absolute; left: -8rpx; top: 23rpx; width: 148rpx; height: 25rpx; border-radius: 10rpx; background: #f4f5ff; box-shadow: 0 5rpx 12rpx rgba(43,45,111,.2); }.package-body { position: absolute; left: 0; top: 38rpx; display: flex; align-items: center; justify-content: center; width: 132rpx; height: 72rpx; border-radius: 8rpx 8rpx 18rpx 18rpx; background: rgba(255,255,255,.94); }.cross { color: #6558ff; font-size: 42rpx; font-weight: 400; }.temp { position: absolute; right: 9rpx; bottom: 7rpx; padding: 2rpx 6rpx; border-radius: 6rpx; color: #fff; background: #6558ff; font-size: 13rpx; }.visual-caption { position: absolute; left: 24rpx; right: 24rpx; bottom: 18rpx; display: flex; justify-content: space-between; color: rgba(255,255,255,.72); font-size: 17rpx; }
-.identity-panel { position: relative; z-index: 2; margin-top: 22rpx; padding: 28rpx 24rpx 24rpx; border: 1rpx solid #e6ebf2; border-radius: 30rpx; background: rgba(255,255,255,.96); box-shadow: 0 16rpx 38rpx rgba(38,53,84,.09); }.panel-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 4rpx 22rpx; }.panel-title { color: #173149; font-size: 31rpx; font-weight: 780; }.panel-subtitle { margin-top: 5rpx; color: #9aa8b9; font-size: 21rpx; }.step-number { color: #d0ccff; font-size: 44rpx; font-weight: 850; }.identity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16rpx; }.identity-card { position: relative; min-height: 156rpx; padding: 22rpx; box-sizing: border-box; border: 1rpx solid #edf0f5; border-radius: 22rpx; background: #f8f9fc; }.identity-icon { display: flex; align-items: center; justify-content: center; width: 52rpx; height: 52rpx; border-radius: 16rpx; color: #6255f6; background: #eae7ff; font-size: 22rpx; font-weight: 750; }.identity-icon.blue { color: #397fbd; background: #e4f2ff; }.identity-icon.green { color: #29996b; background: #e4f6ee; }.identity-icon.orange { color: #bf7b27; background: #fff0dc; }.identity-name { margin-top: 14rpx; color: #324a62; font-size: 26rpx; font-weight: 720; }.identity-description { margin-top: 4rpx; color: #9da9b8; font-size: 19rpx; }.identity-arrow { position: absolute; right: 18rpx; top: 20rpx; color: #b5afef; font-size: 26rpx; }
-.trust-row { position: relative; z-index: 1; display: flex; align-items: center; justify-content: center; gap: 18rpx; margin: 24rpx 8rpx 0; padding: 18rpx 14rpx; border-radius: 20rpx; background: rgba(255,255,255,.52); }.trust-item { display: flex; align-items: center; gap: 7rpx; color: #718298; font-size: 19rpx; }.trust-icon { display: flex; align-items: center; justify-content: center; width: 34rpx; height: 34rpx; border-radius: 11rpx; color: #6558ff; background: #eae7ff; font-size: 16rpx; font-weight: 750; }.trust-divider { width: 1rpx; height: 28rpx; background: #dfe4ec; }.security-note { position: relative; z-index: 1; display: flex; align-items: center; justify-content: center; gap: 10rpx; padding: 20rpx 0 6rpx; color: #a1adbd; font-size: 19rpx; }.security-dot { width: 9rpx; height: 9rpx; border: 3rpx solid #b3adff; border-radius: 50%; }
-.login-page{background:radial-gradient(circle at 90% 2%,rgba(195,255,85,.26),transparent 360rpx),linear-gradient(180deg,#f7ffe9 0,#fbfcf9 48%,#f6faef 100%)}.glow-left{background:rgba(176,239,74,.15)}.glow-right{background:rgba(148,226,36,.18)}.brand-icon{background:linear-gradient(145deg,#91df22,#4cab00);box-shadow:0 10rpx 24rpx rgba(75,166,0,.25)}.brand-name,.eyebrow,.title-dot{color:#55ad06}.visual-card{background:linear-gradient(135deg,#91df20 0%,#5fbd06 52%,#379600 100%);box-shadow:0 18rpx 38rpx rgba(74,151,11,.22)}.cross{color:#54ae06}.temp{background:#54ae06}.step-number{color:#c7eca2}.identity-card{border-color:#e1ead9;background:#fbfdf9}.identity-icon,.trust-icon{color:#50aa03;background:#eff9e7}.identity-icon.blue,.identity-icon.green,.identity-icon.orange{color:#50aa03;background:#eff9e7}.identity-arrow{color:#7cc23d}.security-dot{border-color:#70bd2d}
+.auth-page{position:relative;min-height:100vh;overflow:hidden;padding:42rpx 36rpx 45rpx;box-sizing:border-box;color:#24351e;background:linear-gradient(180deg,#f4ffe4 0,#fbfcf9 40%,#f6faef 100%)}.orb{position:absolute;border-radius:50%;background:rgba(174,243,64,.2)}.orb-one{right:-150rpx;top:-140rpx;width:440rpx;height:440rpx}.orb-two{left:-180rpx;bottom:80rpx;width:350rpx;height:350rpx}.brand{position:relative;z-index:1;display:flex;align-items:center;gap:17rpx}.brand-icon{display:flex;align-items:center;justify-content:center;width:68rpx;height:68rpx;border-radius:20rpx;color:#fff;background:linear-gradient(145deg,#86db17,#47a900);box-shadow:0 10rpx 22rpx rgba(73,164,0,.24);font-size:27rpx;font-weight:800}.brand b,.brand text{display:block}.brand b{color:#4ca600;font-size:18rpx;letter-spacing:3rpx}.brand text{margin-top:4rpx;color:#62715b;font-size:21rpx}.welcome{position:relative;z-index:1;padding:48rpx 5rpx 28rpx}.welcome>text{color:#59b208;font-size:18rpx;font-weight:750;letter-spacing:5rpx}.welcome>view{margin-top:11rpx;color:#17320f;font-size:49rpx;font-weight:850}.welcome i{color:#5db507;font-style:normal}.welcome p{margin:11rpx 0 0;color:#7d8d76;font-size:23rpx;line-height:1.5}.auth-card{position:relative;z-index:2;padding:27rpx;border:1rpx solid #e0ead8;border-radius:29rpx;background:rgba(255,255,255,.97);box-shadow:0 18rpx 45rpx rgba(47,86,18,.1)}.tabs{display:grid;grid-template-columns:1fr 1fr;margin-bottom:27rpx;padding:6rpx;border-radius:16rpx;background:#f0f4ed}.tabs view{padding:15rpx;border-radius:12rpx;color:#7a8475;text-align:center;font-size:25rpx;font-weight:700}.tabs .active{color:#fff;background:linear-gradient(90deg,#80d912,#4dad00);box-shadow:0 7rpx 18rpx rgba(77,169,0,.2)}.field{margin-bottom:21rpx}.field label{display:block;margin:0 0 9rpx 4rpx;color:#596653;font-size:21rpx}.input-wrap{display:flex;align-items:center;height:76rpx;padding:0 19rpx;border:1rpx solid #dfe6da;border-radius:14rpx;background:#fafcf8}.input-wrap:focus-within{border-color:#73c92e;box-shadow:0 0 0 4rpx #eef9e5}.input-wrap>text{margin-right:13rpx;color:#54ac06;font-size:20rpx}.input-wrap input{flex:1;font-size:23rpx}.input-wrap b{color:#58ac0b;font-size:18rpx;font-weight:500}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:15rpx}.helper,.agreement,.security{display:flex;align-items:center}.helper{justify-content:space-between;margin-top:-8rpx;color:#8b9686;font-size:18rpx}.helper text:last-child{color:#51a806}.role-list{display:grid;grid-template-columns:repeat(3,1fr);gap:10rpx}.role-list>view{position:relative;min-height:105rpx;padding:16rpx 12rpx;box-sizing:border-box;border:1rpx solid #e0e6dc;border-radius:13rpx;background:#fafcf9}.role-list .selected{border-color:#68bf1c;background:#f1fae9}.role-list b,.role-list text{display:block}.role-list b{font-size:20rpx}.role-list text{margin-top:6rpx;color:#899483;font-size:15rpx;line-height:1.35}.role-list i{position:absolute;right:8rpx;top:7rpx;color:#55ad06;font-size:18rpx;font-style:normal}.agreement{gap:11rpx;margin-top:22rpx;color:#778271;font-size:18rpx}.agreement>view{display:flex;align-items:center;justify-content:center;width:30rpx;height:30rpx;border:2rpx solid #b8c2b3;border-radius:8rpx}.agreement .checked{color:#fff;border-color:#58b007;background:#58b007}.submit{height:82rpx;margin-top:23rpx;border:0;border-radius:16rpx;color:#fff;background:linear-gradient(90deg,#83dc15,#4aab00);box-shadow:0 12rpx 24rpx rgba(75,165,0,.23);font-size:27rpx;font-weight:750;line-height:82rpx}.switch-tip{padding:21rpx 0 2rpx;color:#52a906;text-align:center;font-size:20rpx}.security{position:relative;z-index:1;justify-content:center;gap:10rpx;margin-top:25rpx;color:#72816c;font-size:19rpx}.security view{color:#55ad07}.dev-note{position:relative;z-index:1;margin-top:15rpx;color:#a2aca0;text-align:center;font-size:17rpx}
 </style>

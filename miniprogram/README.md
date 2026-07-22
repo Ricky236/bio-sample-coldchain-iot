@@ -15,7 +15,7 @@ npm run build:mp-weixin
 
 ## 环境配置
 
-- `VITE_USE_MOCK`：默认不是字符串 `false` 时使用 Mock。
+- `VITE_USE_MOCK`：默认关闭；仅显式设置为 `true` 时使用本机离线 Mock。
 - `VITE_API_BASE_URL`：真实 API 根地址，默认仅供后端本机调试的 `http://127.0.0.1:8020`。
 - `VITE_DEMO_TASK_IDS`：逗号分隔的演示任务 ID，默认 `TASK-001`。
 

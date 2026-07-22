@@ -7,6 +7,12 @@
   "transformPx": false,
   "mp-weixin": {
     "appid": "",
-    "setting": { "urlCheck": false, "es6": true, "minified": true }
+    "setting": {
+      "urlCheck": false,
+      "es6": true,
+      "minified": true,
+      "ignoreDevUnusedFiles": false,
+      "compileHotReLoad": false
+    }
   }
 }

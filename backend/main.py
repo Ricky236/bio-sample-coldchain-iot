@@ -1,11 +1,14 @@
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -59,14 +62,47 @@ class RejectTaskIn(BaseModel):
     reason: str = Field(..., min_length=1, max_length=200)
 
 
+class RegisterIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=20)
+    phone: str = Field(..., pattern=r"^1\d{10}$")
+    organization: str = Field(..., min_length=2, max_length=60)
+    role: str = Field(..., pattern=r"^(sender|carrier|receiver)$")
+    password: str = Field(..., min_length=6, max_length=72)
+
+
+class LoginIn(BaseModel):
+    phone: str = Field(..., pattern=r"^1\d{10}$")
+    password: str = Field(..., min_length=6, max_length=72)
+
+
+class TaskCreateIn(BaseModel):
+    sample_name: str = Field(..., min_length=1, max_length=80)
+    batch: str = Field(default="", max_length=60)
+    receiver: str = Field(..., min_length=2, max_length=80)
+    carrier: str = Field(default="待分配", max_length=80)
+    expected_arrival: Optional[str] = Field(default=None, max_length=40)
+    device_id: str = Field(..., min_length=1, max_length=60)
+    box_id: str = Field(default="", max_length=60)
+    seal_id: str = Field(default="", max_length=60)
+    temperature_range: str = Field(default="2 ~ 8℃", max_length=30)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def get_connection() -> sqlite3.Connection:
+@contextmanager
+def get_connection():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -129,9 +165,44 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL UNIQUE,
+                organization TEXT NOT NULL,
+                role TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
         ensure_column(conn, "task_handoff", "device_id", "TEXT")
         ensure_column(conn, "task_handoff", "rejected_at", "TEXT")
         ensure_column(conn, "task_handoff", "rejection_reason", "TEXT")
+        ensure_column(conn, "task_handoff", "owner_user_id", "TEXT")
+        ensure_column(conn, "task_handoff", "batch", "TEXT")
+        ensure_column(conn, "task_handoff", "expected_arrival", "TEXT")
+        ensure_column(conn, "task_handoff", "box_id", "TEXT")
+        ensure_column(conn, "task_handoff", "seal_id", "TEXT")
+        ensure_column(conn, "task_handoff", "temperature_range", "TEXT")
+        ensure_column(conn, "task_handoff", "created_at", "TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_owner ON task_handoff(owner_user_id)"
+        )
         ensure_demo_task(conn)
 
 
@@ -209,6 +280,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def require_task_authentication(request: Request, call_next):
+    if request.method != "OPTIONS" and request.url.path.startswith("/api/v1/tasks"):
+        init_db()
+        with get_connection() as conn:
+            user = authenticated_user(conn, request.headers.get("authorization"))
+            parts = request.url.path.strip("/").split("/")
+            task_id = parts[3] if len(parts) >= 4 else None
+            task = get_task_by_id(conn, task_id) if task_id else None
+        if not user:
+            return api_error(401, 40111, "authentication required")
+        if task_id and (not task or not user_can_access_task(user, task)):
+            return api_error(404, 40401, "task not found")
+    return await call_next(request)
 
 
 def detect_event(data: DeviceDataIn) -> str:
@@ -328,6 +415,80 @@ def api_error(status_code: int, code: int, message: str) -> JSONResponse:
         status_code=status_code,
         content={"code": code, "message": message, "data": None},
     )
+
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), 210_000
+    ).hex()
+
+
+def serialize_user(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"], "name": row["name"], "phone": row["phone"],
+        "organization": row["organization"], "role": row["role"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_auth_session(conn: sqlite3.Connection, user: sqlite3.Row) -> dict:
+    token = secrets.token_urlsafe(32)
+    created_at = now_iso()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).astimezone().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO auth_tokens (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        (token, user["id"], expires_at, created_at),
+    )
+    return {"token": token, "user": serialize_user(user)}
+
+
+def bearer_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        return ""
+    return authorization[7:].strip()
+
+
+def authenticated_user(conn: sqlite3.Connection, authorization: Optional[str]):
+    token = bearer_token(authorization)
+    if not token:
+        return None
+    row = conn.execute(
+        """
+        SELECT users.* FROM auth_tokens
+        JOIN users ON users.id = auth_tokens.user_id
+        WHERE auth_tokens.token = ? AND auth_tokens.expires_at > ?
+        """,
+        (token, now_iso()),
+    ).fetchone()
+    return row
+
+
+def user_can_access_task(user: sqlite3.Row, task: sqlite3.Row) -> bool:
+    if user["role"] == "admin":
+        return True
+    task_data = row_to_dict(task)
+    if task_data.get("owner_user_id") == user["id"]:
+        return True
+    if user["role"] == "carrier":
+        return task_data.get("carrier") in {user["name"], user["organization"]}
+    if user["role"] == "receiver":
+        return task_data.get("receiver") == user["organization"]
+    return False
+
+
+def next_waybill_id(conn: sqlite3.Connection) -> str:
+    prefix = datetime.now().astimezone().strftime("WD-%Y%m%d-")
+    rows = conn.execute(
+        "SELECT task_id FROM task_handoff WHERE task_id LIKE ? ORDER BY task_id DESC",
+        (f"{prefix}%",),
+    ).fetchall()
+    sequence = 1
+    for row in rows:
+        try:
+            sequence = max(sequence, int(row["task_id"].rsplit("-", 1)[1]) + 1)
+        except (ValueError, IndexError):
+            continue
+    return f"{prefix}{sequence:03d}"
 
 
 def canonical_task_status(task: dict) -> str:
@@ -618,6 +779,68 @@ def get_task_report() -> dict:
     }
 
 
+@app.post("/api/v1/auth/register")
+def register_user(data: RegisterIn):
+    init_db()
+    name = data.name.strip()
+    organization = data.organization.strip()
+    if not name or not organization:
+        return api_error(400, 40010, "name and organization required")
+    with get_connection() as conn:
+        exists = conn.execute("SELECT id FROM users WHERE phone = ?", (data.phone,)).fetchone()
+        if exists:
+            return api_error(409, 40910, "phone already registered")
+        user_id = f"U-{secrets.token_hex(8)}"
+        salt = secrets.token_hex(16)
+        conn.execute(
+            """
+            INSERT INTO users (
+                id, name, phone, organization, role,
+                password_salt, password_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, name, data.phone, organization, data.role, salt,
+             hash_password(data.password, salt), now_iso()),
+        )
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        session = create_auth_session(conn, user)
+    return api_success(session, "registered")
+
+
+@app.post("/api/v1/auth/login")
+def login_user(data: LoginIn):
+    init_db()
+    with get_connection() as conn:
+        user = conn.execute("SELECT * FROM users WHERE phone = ?", (data.phone,)).fetchone()
+        if not user or not hmac.compare_digest(
+            user["password_hash"], hash_password(data.password, user["password_salt"])
+        ):
+            return api_error(401, 40110, "invalid phone or password")
+        conn.execute("DELETE FROM auth_tokens WHERE expires_at <= ?", (now_iso(),))
+        session = create_auth_session(conn, user)
+    return api_success(session, "logged in")
+
+
+@app.get("/api/v1/auth/me")
+def get_current_user(authorization: Optional[str] = Header(default=None)):
+    init_db()
+    with get_connection() as conn:
+        user = authenticated_user(conn, authorization)
+    if not user:
+        return api_error(401, 40111, "authentication required")
+    return api_success(serialize_user(user))
+
+
+@app.post("/api/v1/auth/logout")
+def logout_user(authorization: Optional[str] = Header(default=None)):
+    init_db()
+    token = bearer_token(authorization)
+    if token:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM auth_tokens WHERE token = ?", (token,))
+    return api_success(None, "logged out")
+
+
 @app.get("/api/v1/meta/contracts")
 def get_v1_contracts() -> dict:
     return api_success(
@@ -630,6 +853,61 @@ def get_v1_contracts() -> dict:
             "field_naming": "snake_case",
         }
     )
+
+
+@app.get("/api/v1/tasks")
+def list_v1_tasks(authorization: Optional[str] = Header(default=None)):
+    init_db()
+    with get_connection() as conn:
+        user = authenticated_user(conn, authorization)
+        if not user:
+            return api_error(401, 40111, "authentication required")
+        rows = conn.execute(
+            "SELECT * FROM task_handoff ORDER BY updated_at DESC"
+        ).fetchall()
+        tasks = [serialize_task(row) for row in rows if user_can_access_task(user, row)]
+    return api_success(tasks)
+
+
+@app.post("/api/v1/tasks")
+def create_v1_task(
+    data: TaskCreateIn,
+    authorization: Optional[str] = Header(default=None),
+):
+    init_db()
+    with get_connection() as conn:
+        user = authenticated_user(conn, authorization)
+        if not user:
+            return api_error(401, 40111, "authentication required")
+        if user["role"] not in {"sender", "admin"}:
+            return api_error(403, 40301, "only sender can create task")
+
+        sample_name = data.sample_name.strip()
+        receiver = data.receiver.strip()
+        device_id = data.device_id.strip()
+        if not sample_name or not receiver or not device_id:
+            return api_error(400, 40020, "sample, receiver and device required")
+
+        task_id = next_waybill_id(conn)
+        timestamp = now_iso()
+        conn.execute(
+            """
+            INSERT INTO task_handoff (
+                task_id, device_id, sample_name, sender, receiver, carrier,
+                status, started_at, signed_at, rejected_at, rejection_reason,
+                updated_at, owner_user_id, batch, expected_arrival, box_id,
+                seal_id, temperature_range, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id, device_id, sample_name, user["organization"], receiver,
+                data.carrier.strip() or "待分配", "待装箱", timestamp, user["id"],
+                data.batch.strip(), data.expected_arrival, data.box_id.strip(),
+                data.seal_id.strip(), data.temperature_range.strip(), timestamp,
+            ),
+        )
+        task = get_task_by_id(conn, task_id)
+    return api_success(serialize_task(task), "task created")
 
 
 @app.get("/api/v1/tasks/{task_id}")

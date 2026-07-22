@@ -1,6 +1,6 @@
 {
   "pages": [
-    { "path": "pages/login/index", "style": { "navigationBarTitleText": "身份入口" } },
+    { "path": "pages/login/index", "style": { "navigationBarTitleText": "账户登录" } },
     { "path": "pages/tasks/index", "style": { "navigationBarTitleText": "我的任务", "enablePullDownRefresh": true } },
     { "path": "pages/task-detail/index", "style": { "navigationBarTitleText": "任务详情", "enablePullDownRefresh": true } },
     { "path": "pages/handoff/index", "style": { "navigationBarTitleText": "发出交接" } },

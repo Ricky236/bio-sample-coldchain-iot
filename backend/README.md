@@ -46,6 +46,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Web 管理端和微信小程序统一使用 `/api/v1`：
 
+- `POST /api/v1/auth/register`：注册账户并返回登录会话。
+- `POST /api/v1/auth/login`：手机号与密码登录。
+- `GET /api/v1/auth/me`：通过 Bearer Token 获取当前用户。
+- `POST /api/v1/auth/logout`：注销当前登录会话。
 - `GET /api/v1/meta/contracts`：状态和字段约定。
 - `GET /api/v1/tasks/TASK-001`：任务详情。
 - `GET /api/v1/tasks/TASK-001/telemetry/latest`：最新监测数据。
