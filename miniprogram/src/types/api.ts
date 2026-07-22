@@ -19,3 +19,25 @@ export interface ContractMeta {
   task_statuses: TaskStatus[]; box_statuses: BoxStatus[]; move_statuses: MoveStatus[]
   temperature_statuses: TemperatureStatus[]; timestamp_format: string; field_naming: string
 }
+
+export interface PagedResult<T> { limit: number; items: T[] }
+
+export interface AlarmEvent {
+  id: number; data_id: number; task_id: string; device_id: string; event_type: string
+  event_name: string; event_detail: string; timestamp: string; created_at: string
+}
+
+export interface TraceSummary {
+  total_records: number; min_temperature: number | null; max_temperature: number | null
+  avg_temperature: number | null; min_humidity: number | null; max_humidity: number | null
+  event_count: number
+}
+
+export interface HandoffNode {
+  type: 'started' | 'signed' | 'rejected'; timestamp: string; reason?: string | null
+}
+
+export interface TraceReport {
+  task: Task; latest: Telemetry | null; summary: TraceSummary
+  events: AlarmEvent[]; handoff_nodes: HandoffNode[]
+}

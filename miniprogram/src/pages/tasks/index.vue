@@ -1,63 +1,49 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { onLoad, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
-import StatusTag from '@/components/StatusTag.vue'
 import StatePanel from '@/components/StatePanel.vue'
 import { useSessionStore } from '@/stores/session'
 import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
-import type { Task, TaskStatus } from '@/types/api'
-import { canStartTask, formatTime } from '@/utils/status'
+import type { Task } from '@/types/api'
 
 const session = useSessionStore()
 const tasks = ref<Task[]>([])
 const loading = ref(true)
 const error = ref('')
 const keyword = ref('')
-const filter = ref<'all' | TaskStatus>('all')
+const activeFilter = ref<'all' | 'pending_handoff' | 'in_transit' | 'signed'>('all')
 
 const filtered = computed(() => {
   const query = keyword.value.trim().toLowerCase()
   return tasks.value.filter((task) => {
-    const matchesStatus = filter.value === 'all' || task.status === filter.value
-    const matchesQuery = !query || [task.task_id, task.sample_name, task.device_id, task.sender, task.receiver]
-      .some((value) => value.toLowerCase().includes(query))
-    return matchesStatus && matchesQuery
+    const statusOK = activeFilter.value === 'all' || task.status === activeFilter.value
+    const queryOK = !query || [task.task_id, task.sample_name, task.device_id].some((v) => v.toLowerCase().includes(query))
+    return statusOK && queryOK
   })
 })
+const currentTask = computed(() => tasks.value.find((task) => task.status === 'in_transit') || tasks.value[0] || null)
+const roleName = computed(() => session.user?.role === 'sender' ? '发货方' : session.user?.role === 'carrier' ? '承运方' : session.user?.role === 'receiver' ? '接收方' : '管理员')
 
-const featuredTask = computed(() => filtered.value[0] || null)
-const quickFilters: Array<{ value: 'all' | TaskStatus; label: string; short: string; tone: string }> = [
-  { value: 'all', label: '全部任务', short: '全', tone: 'purple' },
-  { value: 'pending_handoff', label: '待发出', short: '发', tone: 'orange' },
-  { value: 'in_transit', label: '运输中', short: '运', tone: 'blue' },
-  { value: 'signed', label: '已签收', short: '收', tone: 'green' },
-]
-
-function countBy(status: 'all' | TaskStatus) {
+function count(status: typeof activeFilter.value) {
   return status === 'all' ? tasks.value.length : tasks.value.filter((task) => task.status === status).length
 }
-
 async function load() {
-  loading.value = true
-  error.value = ''
+  loading.value = true; error.value = ''
   try { tasks.value = await taskService.listDemoTasks() }
   catch (e) { error.value = errorMessage(e) }
   finally { loading.value = false; uni.stopPullDownRefresh() }
 }
-
-function open(task: Task) {
+function openTask(task = currentTask.value) {
+  if (!task) return uni.showToast({ title: '暂无运单', icon: 'none' })
   uni.navigateTo({ url: `/pages/task-detail/index?task_id=${encodeURIComponent(task.task_id)}` })
 }
-
-function openHandoff() {
-  const task = tasks.value.find((item) => canStartTask(item.status))
-  if (!task) {
-    uni.showToast({ title: '当前没有待发出的任务', icon: 'none' })
-    return
-  }
-  uni.navigateTo({ url: `/pages/handoff/index?task_id=${encodeURIComponent(task.task_id)}` })
+function openPage(page: 'monitor' | 'alarms' | 'handoff' | 'acceptance' | 'trace') {
+  if (!currentTask.value) return uni.showToast({ title: '暂无可操作运单', icon: 'none' })
+  uni.navigateTo({ url: `/pages/${page}/index?task_id=${encodeURIComponent(currentTask.value.task_id)}` })
 }
+function createWaybill() { uni.navigateTo({ url: '/pages/create/index' }) }
+function openProfile() { uni.navigateTo({ url: '/pages/profile/index' }) }
 
 onLoad(() => { if (session.requireSession()) load() })
 onShow(() => { if (session.isAuthenticated && !loading.value) load() })
@@ -65,128 +51,55 @@ onPullDownRefresh(load)
 </script>
 
 <template>
-  <view class="page dashboard-page">
-    <view class="header">
-      <view class="profile">
-        <view class="profile-avatar">{{ session.user?.name.slice(0, 1) }}</view>
-        <view>
-          <view class="hello">你好，{{ session.user?.name }}</view>
-          <view class="greeting">今日转运顺利</view>
-        </view>
+  <view class="home-page">
+    <view class="topbar">
+      <view class="identity">
+        <view class="avatar">{{ session.user?.name?.slice(0, 1) || '冷' }}</view>
+        <view><view class="name-line"><text class="name">{{ session.user?.name }}</text><text class="role">· {{ roleName }}</text></view><view class="greeting">早上好！</view></view>
       </view>
-      <view class="notification" @tap="load">
-        <view class="bell">⌁</view>
-        <view class="notification-dot" />
-      </view>
+      <view class="bell" @tap="openPage('alarms')">♢<view class="dot" /></view>
     </view>
 
-    <view class="search-row">
-      <view class="search-box">
-        <view class="search-icon" />
-        <input v-model="keyword" class="search-input" placeholder="搜索任务、样本或设备" placeholder-class="search-placeholder" />
-      </view>
-      <view class="filter-button" @tap="filter = 'all'">
-        <view class="slider-line line-one"><view class="slider-dot" /></view>
-        <view class="slider-line line-two"><view class="slider-dot" /></view>
-        <view class="slider-line line-three"><view class="slider-dot" /></view>
-      </view>
-    </view>
+    <view class="search"><view class="loc">⌾</view><input v-model="keyword" placeholder="搜索运单号 / 样本 / 设备" /><view class="magnifier" /></view>
 
-    <view class="section-bar">
-      <view class="dashboard-title">快速查看</view>
-      <view class="show-all" @tap="filter = 'all'">查看全部</view>
-    </view>
-
-    <view class="quick-card">
-      <scroll-view scroll-x class="quick-scroll" :show-scrollbar="false">
-        <view class="quick-list">
-          <view
-            v-for="item in quickFilters"
-            :key="item.value"
-            class="quick-item"
-            :class="{ active: filter === item.value }"
-            @tap="filter = item.value"
-          >
-            <view class="quick-icon" :class="item.tone">{{ item.short }}</view>
-            <view class="quick-label">{{ item.label }}</view>
-            <view class="quick-count">{{ countBy(item.value) }} 项</view>
-          </view>
-        </view>
-      </scroll-view>
-    </view>
-
-    <view class="section-bar recommended-heading">
-      <view class="dashboard-title">重点任务</view>
-      <view class="show-all">{{ filtered.length }} 项</view>
-    </view>
-
+    <view class="section-head"><text>当前运单</text><text class="more" @tap="activeFilter = 'all'">查看全部 ›</text></view>
     <StatePanel v-if="loading" state="loading" />
     <StatePanel v-else-if="error" state="error" :message="error" @retry="load" />
-    <StatePanel v-else-if="!featuredTask" state="empty" message="没有找到符合条件的任务" />
-
-    <view v-else-if="featuredTask" class="featured-card" @tap="open(featuredTask)">
-      <view class="featured-visual">
-        <view class="visual-circle circle-one" />
-        <view class="visual-circle circle-two" />
-        <view class="cold-box">
-          <view class="box-lid" />
-          <view class="box-body">+</view>
-        </view>
-        <view class="visual-copy">
-          <view class="visual-label">BIO SAMPLE</view>
-          <view class="visual-title">可信冷链转运</view>
-          <view class="visual-subtitle">全程记录 · 安全交接</view>
-        </view>
-        <view class="favorite">◇</view>
-      </view>
-
-      <view class="featured-content">
-        <view class="row">
-          <view>
-            <view class="featured-code">任务 {{ featuredTask.task_id }}</view>
-            <view class="featured-name">{{ featuredTask.sample_name }}</view>
-          </view>
-          <StatusTag :status="featuredTask.status" />
-        </view>
-
-        <view class="featured-route">
-          <view class="route-node"><view class="route-dot start" /><view><view class="route-caption">发出</view><view class="route-place">{{ featuredTask.sender }}</view></view></view>
-          <view class="route-track"><view class="moving-dot" /></view>
-          <view class="route-node end-node"><view class="route-dot end" /><view><view class="route-caption">接收</view><view class="route-place">{{ featuredTask.receiver }}</view></view></view>
-        </view>
-
-        <view class="featured-footer">
-          <view><view class="footer-label">绑定设备</view><view class="footer-value">{{ featuredTask.device_id }}</view></view>
-          <view class="footer-right"><view class="footer-label">最后更新</view><view class="footer-value small-value">{{ formatTime(featuredTask.updated_at) }}</view></view>
-        </view>
-      </view>
+    <view v-else-if="currentTask" class="waybill-card" @tap="openTask()">
+      <view class="chips"><text>运单号</text><view><text>2~8℃</text><text>{{ currentTask.device_id }}</text></view></view>
+      <view class="waybill-no">{{ currentTask.task_id === 'TASK-001' ? 'WD-20260722-001' : currentTask.task_id }}</view>
+      <view class="sample"><text class="sample-label">样本</text>{{ currentTask.sample_name }}</view>
+      <view class="transport">★　{{ currentTask.status === 'in_transit' ? '运输中' : '待交接' }} · 4.2℃</view>
+      <view class="coldbox"><view class="lid" /><view class="box">❄</view><view class="meter">4.2℃</view></view>
+      <view class="steps"><view class="done">✓<text>建档</text></view><view class="done">✓<text>预检</text></view><view class="done">✓<text>交接</text></view><view class="active">▣<text>在途</text></view><view>□<text>验收</text></view></view>
     </view>
 
-    <view v-if="filtered.length > 1" class="more-list">
-      <view v-for="task in filtered.slice(1)" :key="task.task_id" class="compact-task" @tap="open(task)">
-        <view class="compact-icon">冷</view>
-        <view class="compact-content"><view class="compact-name">{{ task.sample_name }}</view><view class="compact-code">{{ task.task_id }} · {{ task.device_id }}</view></view>
-        <StatusTag :status="task.status" />
-      </view>
+    <view class="pager"><i /><i /><i /></view>
+    <view class="section-head quick-title"><text>快捷操作</text></view>
+    <view class="quick-actions">
+      <view @tap="createWaybill"><b>▤</b><text>新建运单</text></view>
+      <view @tap="openTask()"><b>□</b><text>装箱预检</text></view>
+      <view @tap="openPage('handoff')"><b>↔</b><text>动态交接</text></view>
+      <view @tap="openPage('acceptance')"><b>✓</b><text>到达验收</text></view>
     </view>
 
-    <view class="bottom-space" />
+    <view class="section-head list-title"><text>进行中的任务</text><text class="more">查看全部 ›</text></view>
+    <view class="filters"><text :class="{ active: activeFilter === 'all' }" @tap="activeFilter = 'all'">全部</text><text :class="{ active: activeFilter === 'pending_handoff' }" @tap="activeFilter = 'pending_handoff'">待装箱</text><text :class="{ active: activeFilter === 'in_transit' }" @tap="activeFilter = 'in_transit'">运输中</text><text :class="{ active: activeFilter === 'signed' }" @tap="activeFilter = 'signed'">待验收</text></view>
+    <view class="task-grid">
+      <view v-for="task in filtered" :key="task.task_id" class="mini-task" @tap="openTask(task)"><view class="mini-icon">{{ task.status === 'signed' ? '✓' : '▣' }}</view><view class="mini-copy"><b>{{ task.task_id === 'TASK-001' ? 'WD-20260722-001' : task.task_id }}</b><text>{{ task.sample_name }}</text><small>♨ 4.2℃ · {{ task.status === 'in_transit' ? '运输中' : '待装箱' }}</small><em>♢ 风险低</em></view><view class="arrow">›</view></view>
+    </view>
+
+    <view class="safe-space" />
     <view class="bottom-nav">
-      <view class="nav-item active"><view class="nav-icon home-icon"><view class="home-roof" /></view><text>任务</text></view>
-      <view class="nav-item" @tap="openHandoff"><view class="nav-icon handoff-icon">✓</view><text>交接</text></view>
-      <view class="nav-item" @tap="load"><view class="nav-icon refresh-icon">↻</view><text>刷新</text></view>
-      <view class="nav-item" @tap="session.logout"><view class="nav-icon user-icon"><view class="user-head" /><view class="user-body" /></view><text>退出</text></view>
+      <view class="nav active"><b>▣</b><text>任务</text></view>
+      <view class="nav" @tap="openPage('monitor')"><b>▥</b><text>监控</text></view>
+      <view class="scan" @tap="openPage('handoff')">⌗</view>
+      <view class="nav" @tap="openPage('alarms')"><b>♧</b><text>告警</text></view>
+      <view class="nav" @tap="openProfile"><b>♙</b><text>我的</text></view>
     </view>
   </view>
 </template>
 
 <style scoped>
-.dashboard-page { padding: 34rpx 30rpx 0; background: linear-gradient(180deg, #eef4ff 0, #f6f8fc 510rpx); }
-.header { display: flex; align-items: center; justify-content: space-between; padding: 16rpx 4rpx 38rpx; }.profile { display: flex; align-items: center; gap: 20rpx; }.profile-avatar { display: flex; align-items: center; justify-content: center; width: 78rpx; height: 78rpx; border: 5rpx solid rgba(255,255,255,.85); border-radius: 50%; color: #fff; background: linear-gradient(145deg, #263b5b, #6e7c91); box-shadow: 0 8rpx 20rpx rgba(34,52,82,.16); font-size: 30rpx; font-weight: 750; }.hello { color: #64748a; font-size: 23rpx; }.greeting { margin-top: 5rpx; color: #132b43; font-size: 37rpx; font-weight: 800; }.notification { position: relative; display: flex; align-items: center; justify-content: center; width: 72rpx; height: 72rpx; border-radius: 23rpx; background: rgba(255,255,255,.72); }.bell { transform: rotate(-12deg); color: #53657b; font-size: 41rpx; font-weight: 700; }.notification-dot { position: absolute; right: 17rpx; top: 16rpx; width: 11rpx; height: 11rpx; border: 3rpx solid #fff; border-radius: 50%; background: #6558ff; }
-.search-row { display: flex; gap: 18rpx; margin-bottom: 38rpx; }.search-box { display: flex; align-items: center; flex: 1; height: 94rpx; padding: 0 28rpx; box-sizing: border-box; border: 1rpx solid rgba(224,230,240,.8); border-radius: 25rpx; background: rgba(255,255,255,.94); box-shadow: 0 12rpx 26rpx rgba(60,74,104,.07); }.search-icon { position: relative; width: 28rpx; height: 28rpx; margin-right: 22rpx; border: 4rpx solid #a1adbd; border-radius: 50%; }.search-icon::after { position: absolute; right: -11rpx; bottom: -7rpx; width: 14rpx; height: 4rpx; border-radius: 2rpx; background: #a1adbd; content: ''; transform: rotate(45deg); }.search-input { flex: 1; color: #40566e; font-size: 27rpx; }.search-placeholder { color: #aab5c3; }.filter-button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9rpx; width: 94rpx; height: 94rpx; border-radius: 26rpx; background: linear-gradient(145deg, #7567ff, #5146f6); box-shadow: 0 14rpx 26rpx rgba(91,77,247,.25); }.slider-line { position: relative; width: 40rpx; height: 3rpx; border-radius: 2rpx; background: rgba(255,255,255,.9); }.slider-dot { position: absolute; top: -5rpx; width: 13rpx; height: 13rpx; border: 3rpx solid #fff; border-radius: 50%; background: #6558ff; }.line-one .slider-dot, .line-three .slider-dot { right: 5rpx; }.line-two .slider-dot { left: 5rpx; }
-.section-bar { display: flex; align-items: center; justify-content: space-between; padding: 0 2rpx; }.dashboard-title { color: #152c44; font-size: 37rpx; font-weight: 800; }.show-all { color: #8b96b0; font-size: 23rpx; }.quick-card { margin-top: 20rpx; padding: 25rpx 20rpx; overflow: hidden; border: 1rpx solid #e8edf4; border-radius: 28rpx; background: rgba(255,255,255,.92); box-shadow: 0 12rpx 30rpx rgba(40,55,86,.07); }.quick-scroll { width: 100%; white-space: nowrap; }.quick-list { display: flex; justify-content: space-between; min-width: 650rpx; }.quick-item { width: 132rpx; padding: 9rpx 4rpx; border: 2rpx solid transparent; border-radius: 22rpx; text-align: center; transition: .2s; }.quick-item.active { border-color: #e1ddff; background: #f7f5ff; }.quick-icon { display: flex; align-items: center; justify-content: center; width: 82rpx; height: 72rpx; margin: 0 auto 12rpx; border-radius: 22rpx; color: #fff; background: linear-gradient(145deg, #776aff, #5549ec); font-size: 28rpx; font-weight: 750; box-shadow: inset 0 0 0 1rpx rgba(255,255,255,.2); }.quick-icon.orange { background: linear-gradient(145deg, #f3b45d, #e88c45); }.quick-icon.blue { background: linear-gradient(145deg, #67b6e7, #4788d6); }.quick-icon.green { background: linear-gradient(145deg, #72c9ae, #48a482); }.quick-label { color: #40546c; font-size: 23rpx; font-weight: 650; }.quick-count { margin-top: 4rpx; color: #a2aebe; font-size: 20rpx; }.recommended-heading { margin-top: 42rpx; margin-bottom: 22rpx; }
-.featured-card { overflow: hidden; margin: 0 12rpx; border: 1rpx solid #e5eaf2; border-radius: 30rpx; background: #fff; box-shadow: 0 18rpx 44rpx rgba(38,53,84,.12); }.featured-visual { position: relative; height: 310rpx; overflow: hidden; background: linear-gradient(145deg, #c9d9ff 0%, #a8bfff 48%, #7468e9 100%); }.visual-circle { position: absolute; border-radius: 50%; background: rgba(255,255,255,.17); }.circle-one { width: 350rpx; height: 350rpx; right: -80rpx; top: -110rpx; }.circle-two { width: 240rpx; height: 240rpx; left: -70rpx; bottom: -100rpx; }.cold-box { position: absolute; right: 60rpx; bottom: 38rpx; width: 190rpx; height: 132rpx; border-radius: 18rpx 18rpx 28rpx 28rpx; background: rgba(255,255,255,.92); box-shadow: 0 18rpx 28rpx rgba(59,57,126,.2); text-align: center; }.box-lid { position: absolute; left: -10rpx; top: -22rpx; width: 210rpx; height: 42rpx; border-radius: 16rpx; background: #eef2ff; box-shadow: 0 6rpx 10rpx rgba(59,57,126,.12); }.box-body { margin-top: 35rpx; color: #6558ff; font-size: 72rpx; font-weight: 300; }.visual-copy { position: absolute; left: 34rpx; top: 48rpx; color: #fff; }.visual-label { font-size: 18rpx; font-weight: 750; letter-spacing: 4rpx; opacity: .78; }.visual-title { margin-top: 12rpx; font-size: 36rpx; font-weight: 800; }.visual-subtitle { margin-top: 12rpx; font-size: 21rpx; opacity: .75; }.favorite { position: absolute; right: 22rpx; top: 22rpx; display: flex; align-items: center; justify-content: center; width: 58rpx; height: 58rpx; border-radius: 18rpx; color: #5d50ef; background: rgba(255,255,255,.9); font-size: 32rpx; font-weight: 750; }
-.featured-content { padding: 28rpx 30rpx 26rpx; }.featured-code { color: #98a5b6; font-size: 21rpx; }.featured-name { margin-top: 5rpx; color: #172f47; font-size: 33rpx; font-weight: 780; }.featured-route { display: grid; grid-template-columns: 1fr 86rpx 1fr; align-items: center; margin: 30rpx 0; }.route-node { display: flex; align-items: center; gap: 11rpx; min-width: 0; }.end-node { justify-content: flex-end; text-align: right; }.route-dot { width: 13rpx; height: 13rpx; flex: 0 0 auto; border: 4rpx solid #dedaff; border-radius: 50%; background: #6558ff; }.route-dot.end { border-color: #d7f2e8; background: #54ae8c; }.route-caption { color: #a0acbc; font-size: 19rpx; }.route-place { max-width: 190rpx; margin-top: 3rpx; overflow: hidden; color: #556a81; font-size: 23rpx; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }.route-track { position: relative; height: 3rpx; margin: 0 12rpx; background: #dfe4ed; }.moving-dot { position: absolute; left: 44%; top: -5rpx; width: 13rpx; height: 13rpx; border-radius: 50%; background: #8b81ff; box-shadow: 0 0 0 6rpx #efedff; }.featured-footer { display: flex; justify-content: space-between; padding-top: 22rpx; border-top: 1rpx solid #edf1f5; }.footer-label { color: #a0acbc; font-size: 19rpx; }.footer-value { margin-top: 4rpx; color: #3f556d; font-size: 25rpx; font-weight: 680; }.footer-right { text-align: right; }.small-value { font-size: 21rpx; font-weight: 560; }
-.more-list { margin: 22rpx 12rpx 0; overflow: hidden; border-radius: 24rpx; background: #fff; box-shadow: 0 10rpx 26rpx rgba(38,53,84,.07); }.compact-task { display: flex; align-items: center; gap: 18rpx; padding: 22rpx; border-bottom: 1rpx solid #eef1f5; }.compact-task:last-child { border-bottom: 0; }.compact-icon { display: flex; align-items: center; justify-content: center; width: 64rpx; height: 64rpx; border-radius: 19rpx; color: #6255f6; background: #efedff; font-size: 23rpx; font-weight: 750; }.compact-content { flex: 1; min-width: 0; }.compact-name { overflow: hidden; color: #40566e; font-size: 26rpx; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }.compact-code { margin-top: 5rpx; color: #a0acbc; font-size: 20rpx; }
-.bottom-space { height: 170rpx; }.bottom-nav { position: fixed; z-index: 20; left: 24rpx; right: 24rpx; bottom: calc(18rpx + env(safe-area-inset-bottom)); display: flex; justify-content: space-around; height: 112rpx; padding: 12rpx 18rpx; box-sizing: border-box; border: 1rpx solid rgba(224,229,238,.9); border-radius: 34rpx; background: rgba(255,255,255,.96); box-shadow: 0 18rpx 45rpx rgba(34,48,78,.18); backdrop-filter: blur(16rpx); }.nav-item { display: flex; align-items: center; justify-content: center; gap: 8rpx; width: 116rpx; border-radius: 25rpx; color: #8391a5; font-size: 21rpx; }.nav-item.active { width: 142rpx; color: #5c4ff1; background: #e9e6ff; font-weight: 680; }.nav-icon { position: relative; display: flex; align-items: center; justify-content: center; width: 34rpx; height: 34rpx; font-size: 30rpx; }.home-icon { width: 27rpx; height: 22rpx; margin-top: 6rpx; border-radius: 4rpx; background: currentColor; }.home-roof { position: absolute; left: 2rpx; top: -10rpx; width: 20rpx; height: 20rpx; background: currentColor; transform: rotate(45deg); }.handoff-icon, .refresh-icon { font-weight: 750; }.user-head { position: absolute; top: 0; width: 13rpx; height: 13rpx; border: 4rpx solid currentColor; border-radius: 50%; }.user-body { position: absolute; bottom: 0; width: 28rpx; height: 16rpx; border: 4rpx solid currentColor; border-bottom: 0; border-radius: 18rpx 18rpx 0 0; }
+.home-page{min-height:100vh;padding:36rpx 34rpx 0;box-sizing:border-box;color:#152312;background:radial-gradient(circle at 12% 3%,rgba(185,242,80,.18),transparent 300rpx),#fbfcf9}.topbar,.identity,.name-line,.search,.section-head,.chips,.chips>view,.steps,.quick-actions,.filters,.mini-task,.bottom-nav,.nav{display:flex;align-items:center}.topbar,.section-head,.chips{justify-content:space-between}.identity{gap:20rpx}.avatar{display:flex;align-items:center;justify-content:center;width:82rpx;height:82rpx;border:5rpx solid #d9efb7;border-radius:50%;color:#fff;background:linear-gradient(145deg,#78985d,#345423);font-size:32rpx;font-weight:800}.name-line{gap:8rpx}.name{font-size:31rpx;font-weight:800}.role{color:#52604d;font-size:24rpx}.greeting{margin-top:5rpx;color:#55a806;font-size:27rpx}.bell{position:relative;color:#4ca500;font-size:52rpx}.dot{position:absolute;right:-1rpx;top:1rpx;width:13rpx;height:13rpx;border:3rpx solid #fff;border-radius:50%;background:#61bd00}.search{height:88rpx;margin:28rpx 0 30rpx;padding:0 24rpx;border:1rpx solid #dfe5da;border-radius:44rpx;background:#fff;box-shadow:0 10rpx 28rpx rgba(48,94,12,.05)}.search input{flex:1;font-size:25rpx}.loc{display:flex;align-items:center;justify-content:center;width:56rpx;height:56rpx;margin-right:14rpx;border-radius:50%;color:#fff;background:linear-gradient(135deg,#91e51d,#3ba900);font-size:32rpx}.magnifier{position:relative;width:28rpx;height:28rpx;border:4rpx solid #586057;border-radius:50%}.magnifier:after{position:absolute;right:-11rpx;bottom:-8rpx;width:14rpx;height:4rpx;background:#586057;content:'';transform:rotate(45deg)}.section-head{font-size:31rpx;font-weight:800}.more{color:#7a8177;font-size:23rpx;font-weight:400}.waybill-card{position:relative;overflow:hidden;margin-top:16rpx;padding:26rpx 26rpx 20rpx;border-radius:27rpx;color:#fff;background:radial-gradient(circle at 80% 30%,rgba(205,255,118,.5),transparent 220rpx),linear-gradient(135deg,#75d000,#43a600);box-shadow:0 18rpx 34rpx rgba(79,171,0,.22)}.chips text{padding:6rpx 14rpx;border:1rpx solid rgba(255,255,255,.45);border-radius:999rpx;font-size:19rpx}.chips>view{gap:10rpx}.waybill-no{margin-top:16rpx;font-size:34rpx;font-weight:850;letter-spacing:1rpx}.sample{margin-top:14rpx;font-size:25rpx;font-weight:650}.sample-label{margin-right:12rpx;padding:4rpx 12rpx;border-radius:999rpx;background:rgba(255,255,255,.18);font-size:18rpx}.transport{margin:15rpx 0 25rpx;font-size:23rpx}.coldbox{position:absolute;right:50rpx;top:100rpx}.box{display:flex;align-items:center;justify-content:center;width:120rpx;height:75rpx;border-radius:7rpx 7rpx 16rpx 16rpx;color:#fff;background:rgba(46,125,0,.65);font-size:38rpx}.lid{position:absolute;left:-7rpx;top:-10rpx;width:134rpx;height:23rpx;border-radius:8rpx;background:#e8f6d2}.meter{position:absolute;right:-38rpx;bottom:-12rpx;padding:9rpx 8rpx;border:5rpx solid #e9f6df;border-radius:8rpx;color:#263421;background:#fff;font-size:15rpx}.steps{justify-content:space-between;padding-top:20rpx;border-top:1rpx dashed rgba(255,255,255,.45)}.steps>view{display:flex;flex-direction:column;align-items:center;justify-content:center;width:70rpx;height:70rpx;border-radius:50%;color:rgba(255,255,255,.8);background:rgba(255,255,255,.16);font-size:23rpx}.steps text{margin-top:3rpx;font-size:16rpx}.steps .active{color:#43a700;background:#fff}.pager{display:flex;justify-content:center;gap:12rpx;padding:13rpx}.pager i{width:9rpx;height:9rpx;border-radius:50%;background:#dfe9d4}.pager i:first-child{width:28rpx;border-radius:9rpx;background:#65bb0c}.quick-title{margin-top:4rpx}.quick-actions{justify-content:space-around;margin-top:14rpx;padding:21rpx 8rpx;border:1rpx solid #e7ece1;border-radius:24rpx;background:#fff}.quick-actions>view{display:flex;flex-direction:column;align-items:center;gap:8rpx;color:#36412f;font-size:20rpx}.quick-actions b{display:flex;align-items:center;justify-content:center;width:58rpx;height:58rpx;border-radius:50%;color:#52ac00;background:#f0f9e7;font-size:31rpx}.list-title{margin-top:26rpx}.filters{gap:3rpx;margin:12rpx 0}.filters text{padding:10rpx 23rpx;border:1rpx solid #e1e6dc;border-radius:999rpx;color:#687164;font-size:19rpx}.filters .active{color:#fff;border-color:#55b500;background:linear-gradient(90deg,#79d900,#4caf00)}.task-grid{display:grid;grid-template-columns:1fr 1fr;gap:12rpx}.mini-task{min-width:0;padding:16rpx;border:1rpx solid #e6eadf;border-radius:18rpx;background:#fff}.mini-icon{display:flex;align-items:center;justify-content:center;width:55rpx;height:55rpx;flex:0 0 auto;border-radius:50%;color:#52ad00;background:#edf8e4;font-size:26rpx}.mini-copy{min-width:0;margin-left:12rpx}.mini-copy b,.mini-copy text,.mini-copy small,.mini-copy em{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mini-copy b{font-size:19rpx}.mini-copy text,.mini-copy small{margin-top:3rpx;color:#60695d;font-size:17rpx}.mini-copy em{margin-top:4rpx;color:#56ac08;font-size:16rpx;font-style:normal}.arrow{margin-left:auto;color:#55b20a;font-size:34rpx}.safe-space{height:155rpx}.bottom-nav{position:fixed;z-index:20;left:18rpx;right:18rpx;bottom:calc(12rpx + env(safe-area-inset-bottom));justify-content:space-around;height:104rpx;border:1rpx solid #e4e9df;border-radius:35rpx;background:rgba(255,255,255,.97);box-shadow:0 15rpx 40rpx rgba(39,70,15,.15)}.nav{flex-direction:column;gap:4rpx;color:#70776d;font-size:19rpx}.nav b{font-size:29rpx}.nav.active{color:#52b000}.scan{display:flex;align-items:center;justify-content:center;width:92rpx;height:92rpx;margin-top:-42rpx;border:9rpx solid #dcf8ac;border-radius:50%;color:#fff;background:linear-gradient(145deg,#c5ff55,#67cc00);box-shadow:0 9rpx 25rpx rgba(92,194,0,.38);font-size:49rpx}
 </style>

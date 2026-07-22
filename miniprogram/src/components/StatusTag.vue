@@ -33,9 +33,9 @@ const tone = computed(() => {
   font-weight: 650;
   white-space: nowrap;
 }
-.active { color: #594bf2; background: #eeecff; }
+.active { color: #4a9f00; background: #eff9e7; }
 .success { color: #29996b; background: #e7f7ef; }
-.arrived { color: #247ca7; background: #e7f5fb; }
+.arrived { color: #4a9f00; background: #eff9e7; }
 .danger { color: #cb3e49; background: #ffeaec; }
 .neutral { color: #7d8b9c; background: #edf1f5; }
 </style>

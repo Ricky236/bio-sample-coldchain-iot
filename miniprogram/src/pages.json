@@ -3,12 +3,19 @@
     { "path": "pages/login/index", "style": { "navigationBarTitleText": "身份入口" } },
     { "path": "pages/tasks/index", "style": { "navigationBarTitleText": "我的任务", "enablePullDownRefresh": true } },
     { "path": "pages/task-detail/index", "style": { "navigationBarTitleText": "任务详情", "enablePullDownRefresh": true } },
-    { "path": "pages/handoff/index", "style": { "navigationBarTitleText": "发出交接" } }
+    { "path": "pages/handoff/index", "style": { "navigationBarTitleText": "发出交接" } },
+    { "path": "pages/monitor/index", "style": { "navigationBarTitleText": "实时监控", "enablePullDownRefresh": true } },
+    { "path": "pages/alarms/index", "style": { "navigationBarTitleText": "异常告警", "enablePullDownRefresh": true } },
+    { "path": "pages/acceptance/index", "style": { "navigationBarTitleText": "到达验收" } },
+    { "path": "pages/trace/index", "style": { "navigationBarTitleText": "责任追溯", "enablePullDownRefresh": true } },
+    { "path": "pages/create/index", "style": { "navigationBarTitleText": "创建与预检" } },
+    { "path": "pages/alarm-detail/index", "style": { "navigationBarTitleText": "告警处置" } },
+    { "path": "pages/profile/index", "style": { "navigationBarTitleText": "我的" } }
   ],
   "globalStyle": {
     "navigationBarTextStyle": "black",
     "navigationBarTitleText": "冷链转运",
     "navigationBarBackgroundColor": "#ffffff",
-    "backgroundColor": "#f4f7fb"
+    "backgroundColor": "#fbfcf9"
   }
 }

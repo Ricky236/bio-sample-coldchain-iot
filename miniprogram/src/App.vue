@@ -7,8 +7,8 @@ onLaunch(() => useSessionStore().restore())
 
 <style lang="scss">
 page {
-  background: #f4f7fb;
-  color: #132b43;
+  background: #fbfcf9;
+  color: #24321f;
   font-size: 28rpx;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
@@ -55,11 +55,11 @@ page {
 
 .primary {
   color: #fff;
-  background: linear-gradient(135deg, #7567ff 0%, #5146f6 100%);
-  box-shadow: 0 12rpx 24rpx rgba(91, 77, 247, .22);
+  background: linear-gradient(135deg, #86dc16 0%, #49ad00 100%);
+  box-shadow: 0 12rpx 24rpx rgba(76, 170, 0, .22);
 }
 
-.secondary { color: #5b4df7; background: #efedff; }
+.secondary { color: #50aa03; background: #eff9e7; }
 button::after { border: 0; }
 button[disabled] { opacity: .48; }
 

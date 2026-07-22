@@ -1,5 +1,7 @@
 <script setup lang="ts">
-defineProps<{ visible: boolean; title: string; content: string; loading?: boolean }>()
+withDefaults(defineProps<{ visible: boolean; title: string; content: string; loading?: boolean; confirmText?: string }>(), {
+  confirmText: '确认操作',
+})
 defineEmits<{ confirm: []; cancel: [] }>()
 </script>
 
@@ -11,7 +13,7 @@ defineEmits<{ confirm: []; cancel: [] }>()
       <view class="dialog-content">{{ content }}</view>
       <view class="actions">
         <button class="secondary" :disabled="loading" @tap="$emit('cancel')">暂不操作</button>
-        <button class="primary" :loading="loading" :disabled="loading" @tap="$emit('confirm')">确认发出</button>
+        <button class="primary" :loading="loading" :disabled="loading" @tap="$emit('confirm')">{{ confirmText }}</button>
       </view>
     </view>
   </view>
