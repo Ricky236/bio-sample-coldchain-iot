@@ -44,6 +44,21 @@ function openPage(page: 'monitor' | 'alarms' | 'handoff' | 'acceptance' | 'trace
 }
 function createWaybill() { uni.navigateTo({ url: '/pages/create/index' }) }
 function openProfile() { uni.navigateTo({ url: '/pages/profile/index' }) }
+function tokenFromPayload(payload: string) {
+  const match = payload.match(/[?&]token=([^&]+)/)
+  return match ? decodeURIComponent(match[1]) : payload.trim()
+}
+function scanHandoff() {
+  uni.scanCode({
+    scanType: ['qrCode'],
+    success: ({ result }) => {
+      const token = tokenFromPayload(result)
+      if (!token) return uni.showToast({ title: '未识别到交接二维码', icon: 'none' })
+      uni.navigateTo({ url: `/pages/handoff/index?token=${encodeURIComponent(token)}` })
+    },
+    fail: () => uni.showToast({ title: '未识别到交接二维码', icon: 'none' }),
+  })
+}
 
 onLoad(() => { if (session.requireSession()) load() })
 onShow(() => { if (session.isAuthenticated && !loading.value) load() })
@@ -97,7 +112,7 @@ onPullDownRefresh(load)
     <view class="bottom-nav">
       <view class="nav active"><b>▣</b><text>任务</text></view>
       <view class="nav" @tap="openPage('monitor')"><b>▥</b><text>监控</text></view>
-      <view class="scan" @tap="openPage('handoff')">⌗</view>
+      <view class="scan" @tap="scanHandoff">⌗</view>
       <view class="nav" @tap="openPage('alarms')"><b>♧</b><text>告警</text></view>
       <view class="nav" @tap="openProfile"><b>♙</b><text>我的</text></view>
     </view>

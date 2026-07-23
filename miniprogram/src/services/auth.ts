@@ -1,10 +1,22 @@
 import { appConfig } from '@/config/env'
-import { request } from './request'
+import { ApiError, request } from './request'
 import type { AuthSession, AuthUser, LoginInput, RegisterInput } from '@/types/api'
 
 export const AUTH_SESSION_KEY = 'coldchain_auth_session_v2'
 const MOCK_ACCOUNTS_KEY = 'coldchain_mock_accounts_v2'
 interface MockAccount extends AuthUser { password_hash: string }
+interface BackendUser {
+  user_id: number | string; name: string; phone: string; organization: string
+  role: AuthUser['role']; created_at?: string
+}
+interface BackendSession { token: string; user: BackendUser }
+
+function normalizeUser(user: BackendUser): AuthUser {
+  return {
+    id: String(user.user_id), name: user.name, phone: user.phone,
+    organization: user.organization || '', role: user.role, created_at: user.created_at || '',
+  }
+}
 
 function normalizePhone(value: string) { return value.replace(/\s/g, '') }
 function mockHash(value: string) {
@@ -41,8 +53,21 @@ async function mockLogin(input: LoginInput): Promise<AuthSession> {
 }
 
 export const authService = {
-  register: (input: RegisterInput) => appConfig.useMock ? mockRegister(input) : request<AuthSession>('/api/v1/auth/register', { method: 'POST', data: input }),
-  login: (input: LoginInput) => appConfig.useMock ? mockLogin(input) : request<AuthSession>('/api/v1/auth/login', { method: 'POST', data: input }),
-  me: () => request<AuthUser>('/api/v1/auth/me', { showLoading: false }),
+  register: async (input: RegisterInput) => {
+    if (appConfig.useMock) return mockRegister(input)
+    try {
+      await request<{ user: BackendUser }>('/api/v1/auth/register', { method: 'POST', data: input })
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.statusCode !== 409) throw error
+      // 注册接口已成功但自动登录中断时，再次提交会得到 409；直接按本次密码尝试登录。
+    }
+    return authService.login({ phone: input.phone, password: input.password })
+  },
+  login: async (input: LoginInput) => {
+    if (appConfig.useMock) return mockLogin(input)
+    const session = await request<BackendSession>('/api/v1/auth/login', { method: 'POST', data: input })
+    return { token: session.token, user: normalizeUser(session.user) }
+  },
+  me: async () => normalizeUser(await request<BackendUser>('/api/v1/auth/me', { showLoading: false })),
   logout: () => appConfig.useMock ? Promise.resolve() : request<null>('/api/v1/auth/logout', { method: 'POST', showLoading: false }),
 }

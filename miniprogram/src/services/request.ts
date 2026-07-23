@@ -5,7 +5,22 @@ export class ApiError extends Error {
   constructor(message: string, public statusCode = 0, public code = -1, public detail?: unknown) { super(message) }
 }
 
+const AUTH_SESSION_KEY = 'coldchain_auth_session_v2'
+
 interface RequestOptions { method?: UniApp.RequestOptions['method']; data?: UniApp.RequestOptions['data']; showLoading?: boolean }
+
+function validationMessage(detail: unknown) {
+  if (!Array.isArray(detail)) return ''
+  const fieldNames: Record<string, string> = {
+    sample_name: '样本名称', receiver: '收货单位', carrier: '承运人', expected_arrival: '预计送达',
+    device_id: '设备编号', box_id: '箱体编号', seal_id: '封签编号', temperature_range: '温控范围', batch: '批次',
+  }
+  const first = detail[0] as { loc?: unknown[]; msg?: string }
+  const key = String(first?.loc?.[first.loc.length - 1] || '')
+  const label = fieldNames[key] || key || '表单'
+  const message = first?.msg || '数据不符合要求'
+  return `${label}：${message.replace('String should have at least', '至少需要').replace('characters', '个字符')}`
+}
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const showLoading = options.showLoading !== false
@@ -22,7 +37,12 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     const body = response.data as ApiResponse<T> | { detail?: unknown }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       const api = body as Partial<ApiResponse<T>>
-      throw new ApiError(api.message || `请求失败（${response.statusCode}）`, response.statusCode, api.code, (body as { detail?: unknown }).detail)
+      const detail = (body as { detail?: unknown }).detail
+      if (response.statusCode === 401 && !path.startsWith('/api/v1/auth/')) {
+        uni.removeStorageSync(AUTH_SESSION_KEY)
+        setTimeout(() => uni.reLaunch({ url: '/pages/login/index' }), 50)
+      }
+      throw new ApiError(api.message || validationMessage(detail) || `请求失败（${response.statusCode}）`, response.statusCode, api.code, detail)
     }
     const api = body as ApiResponse<T>
     if (api.code !== 0) throw new ApiError(api.message || '业务请求失败', response.statusCode, api.code)

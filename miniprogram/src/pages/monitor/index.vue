@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { onLoad, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
+import { onLoad, onPullDownRefresh, onShow, onUnload } from '@dcloudio/uni-app'
 import StatePanel from '@/components/StatePanel.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { taskService } from '@/services/tasks'
@@ -15,12 +15,18 @@ const history = ref<Telemetry[]>([])
 const alarmCount = ref(0)
 const loading = ref(true)
 const error = ref('')
+const dataSource = ref<'hardware' | 'local' | 'none'>('none')
+const sourceMessage = ref('')
+let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const chartItems = computed(() => [...history.value].reverse().slice(-18))
 const temperatures = computed(() => chartItems.value.map((item) => item.temperature))
 const minTemp = computed(() => temperatures.value.length ? Math.min(...temperatures.value) : null)
 const maxTemp = computed(() => temperatures.value.length ? Math.max(...temperatures.value) : null)
-const isFresh = computed(() => latest.value ? Date.now() - new Date(latest.value.created_at).getTime() < 10 * 60_000 : false)
+const isFresh = computed(() => {
+  const reportedAt = latest.value?.timestamp || latest.value?.created_at
+  return reportedAt ? Date.now() - new Date(reportedAt).getTime() < 10 * 60_000 : false
+})
 
 function barHeight(value: number) {
   const values = temperatures.value
@@ -30,18 +36,31 @@ function barHeight(value: number) {
   return Math.round(28 + ((value - min) / Math.max(max - min, .1)) * 118)
 }
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
-    const [taskData, latestData, historyData, alarmData] = await Promise.all([
+    const [taskData, latestData, historyData, alarmData, hardware] = await Promise.all([
       taskService.getTask(taskId.value), taskService.getLatestTelemetry(taskId.value),
       taskService.getTelemetryHistory(taskId.value, 60), taskService.getAlarms(taskId.value, 100),
+      taskService.getHardwareSnapshot(taskId.value).catch(() => null),
     ])
     task.value = taskData
-    latest.value = latestData
-    history.value = historyData.items
-    alarmCount.value = alarmData.items.length
+    if (hardware?.matched && hardware.latest) {
+      latest.value = hardware.latest
+      history.value = hardware.history.length ? hardware.history : [hardware.latest]
+      alarmCount.value = hardware.recent_alarms.length
+      dataSource.value = 'hardware'
+      sourceMessage.value = `真实硬件接口 · ${hardware.matched_by === 'task_id' ? '任务号匹配' : '设备号匹配'}`
+    } else {
+      latest.value = latestData
+      history.value = historyData.items
+      alarmCount.value = alarmData.items.length
+      dataSource.value = latestData ? 'local' : 'none'
+      sourceMessage.value = hardware
+        ? `真实接口在线，但没有 ${taskData.task_id} / ${taskData.device_id} 的匹配数据`
+        : '真实硬件接口暂不可用，显示本地后端数据'
+    }
   } catch (e) { error.value = errorMessage(e) }
   finally { loading.value = false; uni.stopPullDownRefresh() }
 }
@@ -52,9 +71,11 @@ onLoad((query) => {
   taskId.value = String(query?.task_id || '')
   if (taskId.value) load()
   else { loading.value = false; error.value = '缺少 task_id' }
+  refreshTimer = setInterval(() => { if (taskId.value && !loading.value) load(true) }, 5000)
 })
 onPullDownRefresh(load)
-onShow(() => { if (taskId.value && !loading.value) load() })
+onShow(() => { if (taskId.value && !loading.value) load(true) })
+onUnload(() => { if (refreshTimer) clearInterval(refreshTimer) })
 </script>
 
 <template>
@@ -65,11 +86,12 @@ onShow(() => { if (taskId.value && !loading.value) load() })
       <view class="monitor-hero">
         <view class="hero-row"><view><view class="eyebrow">LIVE COLD CHAIN</view><view class="hero-title">运输实时监控</view></view><StatusTag :status="task.status" /></view>
         <view class="hero-code">{{ task.task_id }} · {{ task.device_id }}</view>
-        <view class="online-pill" :class="{ offline: !isFresh }"><view class="online-dot" />{{ isFresh ? '设备在线' : '数据可能延迟' }}</view>
+        <view class="online-pill" :class="{ offline: !isFresh }"><view class="online-dot" />{{ isFresh ? '设备在线' : '数据可能延迟' }} · {{ dataSource === 'hardware' ? '真实硬件' : dataSource === 'local' ? '本地数据' : '无数据' }}</view>
+        <view class="source-message">{{ sourceMessage }}</view>
       </view>
 
       <view class="metric-card">
-        <view class="primary-metric"><view class="metric-caption">箱内温度</view><view class="temperature">{{ latest?.temperature ?? '--' }}<text>℃</text></view><view class="range">建议范围 2℃—8℃</view></view>
+        <view class="primary-metric"><view class="metric-caption">箱内温度</view><view class="temperature">{{ latest?.temperature ?? '--' }}<text>℃</text></view><view class="range">建议范围 {{ task.temperature_min ?? 2 }}℃—{{ task.temperature_max ?? 8 }}℃</view></view>
         <view class="metric-side">
           <view><view class="side-label">湿度</view><view class="side-value">{{ latest?.humidity ?? '--' }}%</view></view>
           <view><view class="side-label">更新</view><view class="side-time">{{ formatTime(latest?.created_at || null) }}</view></view>
@@ -114,4 +136,5 @@ onShow(() => { if (taskId.value && !loading.value) load() })
 .refresh { color:#6558ff; font-size:23rpx; }.state-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:13rpx; }.state-item { padding:20rpx 12rpx; border-radius:20rpx; background:#f5f7fb; text-align:center; }.state-icon { display:flex; align-items:center; justify-content:center; width:52rpx; height:52rpx; margin:0 auto 12rpx; border-radius:16rpx; font-size:20rpx; font-weight:750; }.purple { color:#6558ff; background:#eae7ff; }.blue { color:#2f83b7; background:#e5f3fb; }.orange { color:#bd7720; background:#fff0dc; }.state-label { color:#95a3b4; font-size:20rpx; }.state-value { margin-top:6rpx; overflow:hidden; color:#40566e; font-size:23rpx; font-weight:680; text-overflow:ellipsis; white-space:nowrap; }
 .action-grid { display:grid; gap:16rpx; }.action-card { display:grid; grid-template-columns:58rpx 1fr 20rpx; align-items:center; gap:17rpx; padding:22rpx; border:1rpx solid #e7ebf2; border-radius:23rpx; background:#fff; box-shadow:0 8rpx 22rpx rgba(38,54,88,.06); }.action-icon { display:flex; align-items:center; justify-content:center; width:58rpx; height:58rpx; border-radius:18rpx; font-size:29rpx; font-weight:800; }.warning { color:#c97723; background:#fff0dc; }.trace { color:#6558ff; background:#ece9ff; }.action-title { color:#334b63; font-size:26rpx; font-weight:700; }.action-desc { margin-top:4rpx; color:#9ca8b8; font-size:20rpx; }.action-card>text { color:#a6b1bf; font-size:36rpx; }
 .monitor-page{background:#fbfcf9}.monitor-hero{background:linear-gradient(135deg,#80d60c,#46a700);box-shadow:0 16rpx 36rpx rgba(75,166,0,.22)}.range,.chart-range,.refresh{color:#54ad06}.bar{background:linear-gradient(180deg,#9be53e,#51ad08)}.purple,.trace{color:#54ad06;background:#eff9e7}.route-map{position:relative;height:285rpx;padding:0;background:linear-gradient(135deg,#f4f6ee,#eef4e8)}.map-road{position:absolute;height:18rpx;border-radius:20rpx;background:#fff;transform-origin:left center}.road-a{left:-20rpx;top:95rpx;width:680rpx;transform:rotate(-12deg)}.road-b{left:130rpx;top:20rpx;width:450rpx;transform:rotate(65deg)}.road-c{left:260rpx;top:210rpx;width:390rpx;transform:rotate(-48deg)}.route-path{position:absolute;left:65rpx;right:75rpx;top:142rpx;height:8rpx;border-radius:20rpx;background:#51ad08;transform:rotate(5deg)}.map-point{position:absolute;z-index:2;display:flex;align-items:center;justify-content:center;width:43rpx;height:43rpx;border:6rpx solid #fff;border-radius:50%;color:#fff;background:#54b006;font-size:18rpx;font-weight:800}.map-point.start{left:55rpx;top:103rpx}.map-point.current{left:330rpx;top:132rpx;width:58rpx;height:58rpx;color:#184600;background:#d8ff9d}.map-point.end{right:58rpx;top:157rpx}.map-caption{position:absolute;z-index:2;color:#31402b;font-size:20rpx}.map-caption.left{left:35rpx;top:165rpx}.map-caption.right{right:28rpx;top:214rpx}.map-legend{position:absolute;right:15rpx;top:15rpx;padding:12rpx;border-radius:12rpx;background:rgba(255,255,255,.92);font-size:16rpx;line-height:1.8}.map-legend span{color:#e33b42}
+.source-message{margin-top:10rpx;color:rgba(255,255,255,.76);font-size:18rpx}
 </style>

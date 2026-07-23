@@ -12,8 +12,8 @@ defineEmits<{ confirm: []; cancel: [] }>()
       <view class="dialog-title">{{ title }}</view>
       <view class="dialog-content">{{ content }}</view>
       <view class="actions">
-        <button class="secondary" :disabled="loading" @tap="$emit('cancel')">暂不操作</button>
-        <button class="primary" :loading="loading" :disabled="loading" @tap="$emit('confirm')">{{ confirmText }}</button>
+        <button class="secondary dialog-button" :disabled="loading" @tap="$emit('cancel')">暂不操作</button>
+        <button class="primary dialog-button" :loading="loading" :disabled="loading" @tap="$emit('confirm')">{{ confirmText }}</button>
       </view>
     </view>
   </view>
@@ -26,5 +26,5 @@ defineEmits<{ confirm: []; cancel: [] }>()
 .dialog-title { color: #132b43; font-size: 35rpx; font-weight: 750; }
 .dialog-content { margin: 18rpx 8rpx 34rpx; color: #7e8fa4; line-height: 1.7; }
 .actions { display: flex; gap: 18rpx; }
-.actions button { flex: 1; margin: 0; font-size: 27rpx; }
+.actions .dialog-button { flex: 1; margin: 0; font-size: 27rpx; }
 </style>

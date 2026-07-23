@@ -20,6 +20,8 @@ export interface Task {
   rejection_reason: string | null; updated_at: string; owner_user_id?: string | null; batch?: string | null
   expected_arrival?: string | null; box_id?: string | null; seal_id?: string | null
   temperature_range?: string | null; created_at?: string | null
+  carrier_user_id?: string | number | null; receiver_user_id?: string | number | null
+  temperature_min?: number | null; temperature_max?: number | null
 }
 export interface CreateTaskInput {
   sample_name: string; batch: string; receiver: string; carrier: string; expected_arrival: string
@@ -42,6 +44,13 @@ export interface AlarmEvent {
   event_name: string; event_detail: string; timestamp: string; created_at: string
 }
 
+export interface HardwareSnapshot {
+  source_url: string; generated_at: string | null
+  requested_task_id: string; requested_device_id: string | null
+  matched: boolean; matched_by: 'task_id' | 'device_id' | null
+  latest: Telemetry | null; history: Telemetry[]; recent_alarms: AlarmEvent[]
+}
+
 export interface TraceSummary {
   total_records: number; min_temperature: number | null; max_temperature: number | null
   avg_temperature: number | null; min_humidity: number | null; max_humidity: number | null
@@ -55,4 +64,31 @@ export interface HandoffNode {
 export interface TraceReport {
   task: Task; latest: Telemetry | null; summary: TraceSummary
   events: AlarmEvent[]; handoff_nodes: HandoffNode[]
+}
+
+export interface HandoffQr {
+  handoff_id: string; token: string; expires_at: string; ttl_seconds: number
+  qr_payload: string; qr_image_data_url: string | null
+}
+export interface HandoffFaceState { verified: boolean; quality_score: number; verified_at: string }
+export interface HandoffSession {
+  handoff_id: string; task_id: string; action?: string; status: string
+  issuer_user_id: string | number; recipient_user_id: string | number | null; expires_at: string
+  confirmed_at: string | null; note?: string | null; qr_verified_at?: string | null
+  faces: { issuer?: HandoffFaceState; recipient?: HandoffFaceState }
+}
+export interface FaceVerification {
+  verification_id: string; party: 'issuer' | 'recipient'; verified: boolean
+  face_count: number; quality_score: number; expires_at: string
+}
+export interface DevicePrecheck {
+  device_id: string; online: boolean; passed: boolean; temperature: number | null
+  humidity: number | null; box_status: BoxStatus | null; move_status: MoveStatus | null
+  reported_at: string | null; reason: string; source?: 'hardware' | 'local' | 'none'
+  available_device_ids?: string[]; suggested_device_id?: string | null
+  fresh?: boolean; age_seconds?: number | null
+}
+export interface DeviceBindingCheck {
+  device_id: string; box_id: string; seal_id: string; available: boolean
+  occupied_task_id: string | null; checked_at: string; message: string
 }
