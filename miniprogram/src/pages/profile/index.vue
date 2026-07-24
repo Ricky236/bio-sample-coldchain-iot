@@ -13,7 +13,7 @@ function showCodeHelp() { uni.showModal({ title: '动态码说明', content: '�
   <view class="profile-page">
     <view class="profile-head"><view class="avatar">{{ session.user?.name?.slice(0,1) || '用' }}<view>▣</view></view><view class="identity"><view><b>{{ session.user?.name }}</b><text>{{ role }}</text></view><p>{{ session.user?.organization }}</p><small>{{ session.user?.phone }}</small></view></view>
     <view class="auth-card"><view><b>◎</b><view><strong>账户身份</strong><text>已登录</text></view></view><i/><view><b>✓</b><view><strong>角色权限</strong><p>权限由注册资料确定</p></view></view></view>
-    <view class="group"><label>业务</label><view @tap="back"><b>◆</b><text>我的运单</text><i>›</i></view><view @tap="go('/pages/trace/index?task_id=TASK-001')"><b>▤</b><text>交接记录</text><i>›</i></view><view @tap="go('/pages/trace/index?task_id=TASK-001')"><b>▥</b><text>证据报告</text><i>›</i></view></view>
+    <view class="group"><label>业务</label><view @tap="back"><b>◆</b><text>我的运单</text><i>›</i></view><view @tap="go('/pages/tasks/index')"><b>▤</b><text>交接记录</text><i>›</i></view><view @tap="go('/pages/monitor-pick/index')"><b>▥</b><text>运输监控</text><i>›</i></view></view>
     <view class="group"><label>安全</label><view @tap="notify('账户状态正常')"><b>♢</b><text>账户与核验状态</text><i>›</i></view><view @tap="showCodeHelp"><b>▣</b><text>动态码说明</text><i>›</i></view></view>
     <view class="group"><label>系统</label><view @tap="notify('当前已是最新版本')"><b>ⓘ</b><text>关于</text><i>›</i></view><view class="logout" @tap="session.logout()"><b>⇥</b><text>退出登录</text><i>›</i></view></view>
   </view>

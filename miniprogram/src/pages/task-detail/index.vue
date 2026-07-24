@@ -3,6 +3,8 @@ import { computed, ref } from 'vue'
 import { onLoad, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import StatusTag from '@/components/StatusTag.vue'
 import StatePanel from '@/components/StatePanel.vue'
+import RouteTrackCard from '@/components/RouteTrackCard.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
 import { useSessionStore } from '@/stores/session'
@@ -13,11 +15,14 @@ const session = useSessionStore()
 const taskId = ref('')
 const task = ref<Task | null>(null)
 const telemetry = ref<Telemetry | null>(null)
+const history = ref<Telemetry[]>([])
 const loading = ref(true)
 const error = ref('')
 const receivers = ref<AssignmentCandidate[]>([])
 const receiverIndex = ref(-1)
 const assigningReceiver = ref(false)
+const deleteVisible = ref(false)
+const deleting = ref(false)
 const canStart = computed(() => task.value ? canStartTask(task.value.status) : false)
 const isAssignedReceiver = computed(() => Boolean(
   task.value
@@ -58,21 +63,55 @@ const canEdit = computed(() => Boolean(
     )
   ),
 ))
+const canDelete = computed(() => Boolean(
+  task.value
+  && ['pending_pack', 'pending_handoff', 'canceled'].includes(task.value.status)
+  && (
+    session.user?.role === 'admin'
+    || (
+      session.user?.role === 'sender'
+      && String(task.value.owner_user_id || '') === String(session.user?.id || '')
+    )
+  ),
+))
+const trackStage = computed(() => {
+  if (!task.value) return 'transit' as const
+  if (canStartTask(task.value.status)) return 'send' as const
+  if (['in_transit', 'arrived'].includes(task.value.status)) return 'transit' as const
+  return 'receive' as const
+})
+const trackItems = computed(() => {
+  if (history.value.length) return history.value
+  return telemetry.value ? [telemetry.value] : []
+})
 
-async function load() {
-  loading.value = true
-  error.value = ''
+async function load(options: { silent?: boolean } = {}) {
+  const silent = Boolean(options.silent)
+  if (!silent) {
+    loading.value = true
+    error.value = ''
+  }
   try {
-    [task.value, telemetry.value] = await Promise.all([
-      taskService.getTask(taskId.value),
-      taskService.getLatestTelemetry(taskId.value),
+    const quiet = silent ? { showLoading: false as const } : {}
+    const [taskData, latestData, historyData] = await Promise.all([
+      taskService.getTask(taskId.value, quiet),
+      taskService.getLatestTelemetry(taskId.value, quiet),
+      taskService.getTelemetryHistory(taskId.value, 100, quiet),
     ])
+    task.value = taskData
+    telemetry.value = latestData
+    history.value = historyData.items || []
     if (canRepairReceiver.value && !receivers.value.length) {
       const result = await taskService.listCandidates('receiver')
       receivers.value = result.items
     }
-  } catch (e) { error.value = errorMessage(e) }
-  finally { loading.value = false; uni.stopPullDownRefresh() }
+    if (!silent) error.value = ''
+  } catch (e) {
+    if (!silent || !task.value) error.value = errorMessage(e)
+  } finally {
+    loading.value = false
+    uni.stopPullDownRefresh()
+  }
 }
 
 function handoff() {
@@ -113,14 +152,34 @@ async function assignMissingReceiver() {
   } finally { assigningReceiver.value = false }
 }
 
+async function confirmDelete() {
+  if (!task.value || deleting.value) return
+  deleting.value = true
+  try {
+    await taskService.deleteTask(task.value.task_id)
+    deleteVisible.value = false
+    uni.showToast({ title: '运单已删除', icon: 'success' })
+    setTimeout(() => {
+      uni.reLaunch({ url: '/pages/tasks/index' })
+    }, 400)
+  } catch (e) {
+    uni.showToast({ title: errorMessage(e), icon: 'none', duration: 3000 })
+  } finally {
+    deleting.value = false
+  }
+}
+
 onLoad((query) => {
   if (!session.requireSession()) return
   taskId.value = String(query?.task_id || '')
   if (!taskId.value) { error.value = '缺少 task_id'; loading.value = false; return }
   load()
 })
-onPullDownRefresh(load)
-onShow(() => { if (taskId.value && !loading.value) load() })
+onPullDownRefresh(() => load())
+onShow(() => {
+  // 静默刷新：避免 loading 整页切换导致地图/设备状态反复卸载闪烁
+  if (taskId.value && !loading.value) load({ silent: Boolean(task.value) })
+})
 </script>
 
 <template>
@@ -160,6 +219,13 @@ onShow(() => { if (taskId.value && !loading.value) load() })
       </view>
 
       <view v-if="!telemetry" class="empty-strip">暂无设备数据，等待设备上传…</view>
+
+      <RouteTrackCard
+        :title="canStart ? '设备位置' : '发出 / 交接 / 接收位置与轨迹'"
+        :items="trackItems"
+        :stage="trackStage"
+        :departed="!canStart"
+      />
 
       <view class="card status-card">
         <view class="section-heading">
@@ -204,6 +270,17 @@ onShow(() => { if (taskId.value && !loading.value) load() })
       <button v-if="canStart" class="primary action-button" @tap="handoff">进入发出交接</button>
       <button v-else-if="canArrivalHandoff" class="primary action-button" @tap="handoff">发起到达交接</button>
       <button v-else-if="canAccept" class="primary action-button" @tap="openPage('acceptance')">进入到达验收</button>
+      <button v-if="canDelete" class="danger delete-button" @tap="deleteVisible = true">删除运单</button>
+
+      <ConfirmDialog
+        :visible="deleteVisible"
+        title="确认删除运单？"
+        :content="`将永久删除 ${task.task_id}，此操作不可恢复。`"
+        confirm-text="确认删除"
+        :loading="deleting"
+        @cancel="deleteVisible = false"
+        @confirm="confirmDelete"
+      />
     </template>
   </view>
 </template>
@@ -217,5 +294,6 @@ onShow(() => { if (taskId.value && !loading.value) load() })
 .workspace-grid { display:grid; grid-template-columns:1fr 1fr; gap:14rpx; }.workspace-item { padding:20rpx; border:1rpx solid #edf0f5; border-radius:20rpx; background:#f8f9fc; }.workspace-icon { display:flex; align-items:center; justify-content:center; width:48rpx; height:48rpx; margin-bottom:12rpx; border-radius:15rpx; font-size:20rpx; font-weight:750; }.workspace-icon.orange { color:#bd7720; background:#fff0dc; }.workspace-title { color:#40566e; font-size:24rpx; font-weight:690; }.workspace-desc { margin-top:4rpx; color:#99a6b6; font-size:19rpx; }
 .detail-page{background:#fbfcf9}.detail-tabs{display:flex;margin-bottom:20rpx;overflow:hidden;border:1rpx solid #dfe5da;border-radius:999rpx;background:#fff}.detail-tabs text{flex:1;padding:17rpx 4rpx;color:#6d7569;text-align:center;font-size:20rpx}.detail-tabs .active{color:#fff;border-radius:999rpx;background:linear-gradient(90deg,#79d70d,#4aad00)}.hero-card{color:#fff;border:0;background:radial-gradient(circle at 80% 20%,rgba(220,255,144,.35),transparent 260rpx),linear-gradient(135deg,#7fd20c,#48a900);box-shadow:0 15rpx 35rpx rgba(74,162,0,.2)}.accent{display:none}.hero-card .task-code,.hero-card .metric-label,.hero-card .metric-status,.hero-card .updated{color:rgba(255,255,255,.72)}.hero-card .sample-name,.hero-card .metric-value{color:#fff}.hero-card .unit,.hero-card .route-line-text,.hero-card .arrow{color:rgba(255,255,255,.85)}.hero-route{margin-top:5rpx;font-size:24rpx;opacity:.9}.refresh{color:#53ad05}.purple{color:#54ad06;background:#eff9e7}
 .edit-tip{margin:28rpx 8rpx 12rpx;color:#8c9983;font-size:21rpx;text-align:center}.edit-button{width:100%;height:78rpx;border:2rpx solid #63bd17;border-radius:20rpx;color:#55ad0b;background:#fff;font-size:25rpx;line-height:74rpx}.edit-button+.action-button{margin-top:18rpx}
+.delete-button{width:100%;height:78rpx;margin-top:18rpx;border:2rpx solid #e8b4b8;border-radius:20rpx;color:#c23b45;background:#fff;font-size:25rpx;line-height:74rpx}
 .repair-card{border-color:#f0d49b;background:#fffaf0}.repair-hint{margin:14rpx 0;color:#8c7040;font-size:21rpx;line-height:1.6}.receiver-picker{height:70rpx;padding:0 20rpx;border:1rpx solid #dfdfd5;border-radius:14rpx;color:#455a72;background:#fff;line-height:70rpx}.repair-button{height:72rpx;margin-top:16rpx;border-radius:16rpx;color:#fff;background:#58b608;font-size:23rpx;line-height:72rpx}
 </style>

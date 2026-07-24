@@ -1,5 +1,8 @@
 # 正式 `/api/v1` 接口契约
 
+> **完整后端接口文档（全量路由 / 错误码 / 环境变量 / Legacy）**：[`BACKEND_API.md`](./BACKEND_API.md)  
+> **OpenAPI 机器可读**：[`openapi.json`](./openapi.json)
+
 ## 约定
 
 - 本地基础地址：`http://127.0.0.1:8000`

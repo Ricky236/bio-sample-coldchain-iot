@@ -16,6 +16,14 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+# 尽早加载 backend/.env，便于生产用环境变量覆盖默认值
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:
+    pass
+
 from fastapi import Body, FastAPI, File, Form, Header, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -28,26 +36,65 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "device_data.db"))
-FILE_STORAGE_DIR = Path(os.environ.get("FILE_STORAGE_DIR", BASE_DIR / "uploads"))
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_data_path(env_name: str, default_relative: str) -> Path:
+    raw = os.environ.get(env_name, default_relative)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+DATABASE_PATH = _resolve_data_path("DATABASE_PATH", "data/device_data.db")
+FILE_STORAGE_DIR = _resolve_data_path("FILE_STORAGE_DIR", "data/uploads")
 CORS_ORIGIN_REGEX = os.environ.get(
     "CORS_ORIGIN_REGEX",
     r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
 )
-ALLOW_ADMIN_SELF_REGISTER = (
-    os.environ.get("ALLOW_ADMIN_SELF_REGISTER", "false").strip().lower() == "true"
-)
+ALLOW_ADMIN_SELF_REGISTER = _env_flag("ALLOW_ADMIN_SELF_REGISTER", "false")
+# 生产默认关闭：无鉴权旧接口、演示看板、OpenAPI 文档
+ENABLE_LEGACY_DEMO_API = _env_flag("ENABLE_LEGACY_DEMO_API", "false")
+ENABLE_DEMO_DASHBOARD = _env_flag("ENABLE_DEMO_DASHBOARD", "false")
+ENABLE_API_DOCS = _env_flag("ENABLE_API_DOCS", "false")
+ALLOW_LOCAL_SIMULATION = _env_flag("ALLOW_LOCAL_SIMULATION", "false")
+# 仅当公网快照可见该设备时允许自动登记（不再硬编码 CLD-001）
+ALLOW_DEVICE_AUTO_REGISTER = _env_flag("ALLOW_DEVICE_AUTO_REGISTER", "true")
+# 从公网硬件拉取 live-snapshot / events（仅开发机）；
+# 硬件直传落库的服务器必须设 false，改为读本地库，禁止 HTTP 自拉
+ENABLE_LIVE_HARDWARE_PROXY = _env_flag("ENABLE_LIVE_HARDWARE_PROXY", "true")
+HARDWARE_PUBLIC_BASE = os.environ.get(
+    "HARDWARE_PUBLIC_BASE",
+    "http://47.103.152.175:8080",
+).rstrip("/")
 LIVE_SNAPSHOT_URL = os.environ.get(
     "LIVE_SNAPSHOT_URL",
-    "http://47.103.152.175:8080/api/v1/admin/live-snapshot",
+    f"{HARDWARE_PUBLIC_BASE}/api/v1/admin/live-snapshot",
 )
-LIVE_SNAPSHOT_TIMEOUT = float(os.environ.get("LIVE_SNAPSHOT_TIMEOUT", "6"))
+LIVE_SNAPSHOT_TIMEOUT = float(os.environ.get("LIVE_SNAPSHOT_TIMEOUT", "15"))
 LIVE_SNAPSHOT_CACHE_SECONDS = float(
     os.environ.get("LIVE_SNAPSHOT_CACHE_SECONDS", "3")
+)
+LIVE_DEVICE_LATEST_URL = os.environ.get(
+    "LIVE_DEVICE_LATEST_URL",
+    f"{HARDWARE_PUBLIC_BASE}/api/device/latest",
+)
+LIVE_DEVICE_HISTORY_URL = os.environ.get(
+    "LIVE_DEVICE_HISTORY_URL",
+    f"{HARDWARE_PUBLIC_BASE}/api/device/history",
+)
+LIVE_DEVICE_EVENTS_URL = os.environ.get(
+    "LIVE_DEVICE_EVENTS_URL",
+    f"{HARDWARE_PUBLIC_BASE}/api/device/events",
 )
 PRECHECK_MAX_DATA_AGE_SECONDS = float(
     os.environ.get("PRECHECK_MAX_DATA_AGE_SECONDS", "120")
 )
+SEED_DEMO_TASK = _env_flag("SEED_DEMO_TASK", "false")
 _live_snapshot_cache: tuple[float, dict] | None = None
 
 DEMO_TASK = {
@@ -68,6 +115,14 @@ TASK_STATUSES = [
     "rejected",
     "canceled",
 ]
+# 传感器上报可归属的在途/装箱态（已签收/取消等不再改写）
+ACTIVE_INGEST_TASK_STATUSES = {
+    "pending_pack",
+    "pending_handoff",
+    "in_transit",
+    "arrived",
+}
+TERMINAL_TASK_STATUSES = {"signed", "rejected", "canceled"}
 BOX_STATUSES = ["BOX_OPEN", "BOX_CLOSED"]
 MOVE_STATUSES = ["STABLE", "MILD", "SEVERE", "IMPACT", "FREE_FALL"]
 TEMPERATURE_STATUSES = ["TEMP_OK", "TEMP_ALERT"]
@@ -111,6 +166,9 @@ EVENT_DISPLAY_LABELS = {
 LOW_BATTERY_THRESHOLD = 20
 DEVICE_OFFLINE_SECONDS = 300
 DEVICE_OFFLINE_SCAN_SECONDS = int(os.environ.get("DEVICE_OFFLINE_SCAN_SECONDS", "60"))
+# 光敏箱体判定（暗处 raw 高、亮处 raw 低）。
+# 公网当前实测关闭约 light_raw≈6400，故将关箱阈值下调，避免仍误判为开箱。
+# 可用环境变量覆盖：LIGHT_BOX_STATUS_OVERRIDE / LIGHT_BOX_OPEN_THRESHOLD / LIGHT_BOX_CLOSE_THRESHOLD
 LOGIN_RATE_LIMIT = 6
 VERIFY_RATE_LIMIT = 10
 RATE_LIMIT_WINDOW_SECONDS = 60
@@ -153,6 +211,9 @@ class DeviceDataIn(BaseModel):
     acc_total: float
     motion_score: float
     timestamp: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    accuracy: Optional[float] = None
 
 
 class LocationIn(BaseModel):
@@ -373,8 +434,174 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
 
+def build_local_hardware_snapshot(
+    telemetry_limit: int = 20,
+    alarm_limit: int = 50,
+    device_history_limit: int = 50,
+) -> dict:
+    """从本机 SQLite 组装硬件快照（传感器已直传落库时用，禁止 HTTP 自拉）。"""
+    init_db()
+    with get_connection() as conn:
+        task_rows = conn.execute(
+            "SELECT * FROM task_handoff ORDER BY updated_at DESC"
+        ).fetchall()
+        tasks = [enrich_task(row, conn) for row in task_rows]
+
+        device_rows = conn.execute(
+            "SELECT * FROM devices ORDER BY updated_at DESC"
+        ).fetchall()
+        devices = [serialize_device(row) for row in device_rows]
+
+        latest_telemetry_by_task: dict[str, dict] = {}
+        telemetry_history_by_task: dict[str, list[dict]] = {}
+        for task in tasks:
+            task_id = task["task_id"]
+            telem_rows = conn.execute(
+                """
+                SELECT * FROM device_data
+                WHERE task_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (task_id, telemetry_limit),
+            ).fetchall()
+            if telem_rows:
+                history = [normalize_telemetry(row) for row in telem_rows]
+                telemetry_history_by_task[task_id] = history
+                latest_telemetry_by_task[task_id] = history[0]
+
+        # 无任务绑定的设备流也按 device 最新点补齐，便于按 device_id 回退
+        if not latest_telemetry_by_task:
+            latest_row = conn.execute(
+                """
+                SELECT * FROM device_data
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_row:
+                item = normalize_telemetry(latest_row)
+                key = str(item.get("task_id") or "TASK-UNKNOWN")
+                latest_telemetry_by_task[key] = item
+                telemetry_history_by_task[key] = [item]
+
+        # 即便已有按任务聚合，也按 device_id 补一条最新点，供预检/交接按设备匹配
+        device_latest_rows = conn.execute(
+            """
+            SELECT d.*
+            FROM device_data d
+            INNER JOIN (
+                SELECT device_id, MAX(id) AS max_id
+                FROM device_data
+                WHERE device_id IS NOT NULL AND TRIM(device_id) != ''
+                GROUP BY device_id
+            ) latest ON d.id = latest.max_id
+            """
+        ).fetchall()
+        for row in device_latest_rows:
+            item = normalize_telemetry(row)
+            device_id = str(item.get("device_id") or "")
+            if not device_id:
+                continue
+            already = any(
+                str(v.get("device_id") or "") == device_id
+                for v in latest_telemetry_by_task.values()
+            )
+            if already:
+                continue
+            key = str(item.get("task_id") or f"DEVICE-{device_id}")
+            latest_telemetry_by_task[key] = item
+            if key not in telemetry_history_by_task:
+                hist_rows = conn.execute(
+                    """
+                    SELECT * FROM device_data
+                    WHERE device_id = ?
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (device_id, telemetry_limit),
+                ).fetchall()
+                telemetry_history_by_task[key] = [
+                    normalize_telemetry(r) for r in hist_rows
+                ]
+
+        alarm_rows = conn.execute(
+            """
+            SELECT * FROM event_log
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (alarm_limit,),
+        ).fetchall()
+        recent_alarms = [normalize_event(row) for row in alarm_rows]
+
+        history_rows = conn.execute(
+            """
+            SELECT * FROM device_data
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (device_history_limit,),
+        ).fetchall()
+        recent_device_data = [row_to_dict(row) for row in history_rows]
+
+    return {
+        "generated_at": now_iso(),
+        "database_path": Path(DATABASE_PATH).name,
+        "live_snapshot_url": None,
+        "live_snapshot_sync": False,
+        "source": "local_db",
+        "tasks": tasks,
+        "devices": devices,
+        "latest_telemetry_by_task": latest_telemetry_by_task,
+        "telemetry_history_by_task": telemetry_history_by_task,
+        "recent_alarms": recent_alarms,
+        "recent_device_data": recent_device_data,
+        "limits": {
+            "telemetry_limit": telemetry_limit,
+            "alarm_limit": alarm_limit,
+            "device_history_limit": device_history_limit,
+        },
+    }
+
+
+def fetch_live_device_history(limit: int = 120) -> list[dict]:
+    """拉取设备历史：本机落库直读；开发机才 HTTP 代理公网。"""
+    if not ENABLE_LIVE_HARDWARE_PROXY:
+        init_db()
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM device_data
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [normalize_telemetry(row) for row in rows]
+    request = urllib.request.Request(
+        LIVE_DEVICE_HISTORY_URL,
+        headers={"Accept": "application/json", "User-Agent": "coldchain-backend/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("items") or payload.get("data") or []
+    else:
+        items = []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)][: max(1, limit)]
+
+
 def fetch_live_hardware_snapshot() -> dict:
-    """读取真实硬件聚合快照，并短时缓存以避免页面轮询压垮设备服务。"""
+    """读取真实硬件数据。
+
+    - 硬件直传本机（ENABLE_LIVE_HARDWARE_PROXY=false）：只读本地 SQLite，绝不 HTTP 自拉。
+    - 开发/旁路机（proxy=true）：从 HARDWARE_PUBLIC_BASE 拉取公网快照。
+    """
     global _live_snapshot_cache
     monotonic_now = time.monotonic()
     if (
@@ -382,27 +609,106 @@ def fetch_live_hardware_snapshot() -> dict:
         and monotonic_now - _live_snapshot_cache[0] < LIVE_SNAPSHOT_CACHE_SECONDS
     ):
         return _live_snapshot_cache[1]
-    live_request = urllib.request.Request(
-        LIVE_SNAPSHOT_URL,
+
+    if not ENABLE_LIVE_HARDWARE_PROXY:
+        data = build_local_hardware_snapshot(
+            telemetry_limit=120,
+            alarm_limit=50,
+            device_history_limit=120,
+        )
+        _live_snapshot_cache = (monotonic_now, data)
+        return data
+
+    errors: list[str] = []
+    latest_data: Optional[dict] = None
+
+    # 1) fast path: device latest + history
+    latest_request = urllib.request.Request(
+        LIVE_DEVICE_LATEST_URL,
         headers={"Accept": "application/json", "User-Agent": "coldchain-backend/1.0"},
     )
     try:
-        with urllib.request.urlopen(
-            live_request, timeout=LIVE_SNAPSHOT_TIMEOUT
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(latest_request, timeout=5) as response:
+            latest = json.loads(response.read().decode("utf-8"))
+        if not isinstance(latest, dict) or not latest.get("device_id"):
+            raise RuntimeError("device latest returned empty payload")
+        task_id = str(latest.get("task_id") or "TASK-UNKNOWN")
+        device_id = str(latest.get("device_id") or "")
+        history_items = [latest]
+        try:
+            raw_history = fetch_live_device_history(120)
+            matched = [
+                item
+                for item in raw_history
+                if str(item.get("device_id") or "") == device_id
+            ]
+            if matched:
+                history_items = matched
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            json.JSONDecodeError,
+            RuntimeError,
+        ) as hist_exc:
+            errors.append(f"history: {hist_exc}")
+        latest_data = {
+            "generated_at": latest.get("timestamp") or latest.get("created_at"),
+            "latest_telemetry_by_task": {task_id: latest},
+            "telemetry_history_by_task": {task_id: history_items},
+            "recent_alarms": [],
+            "fallback": "device_latest",
+        }
     except (
         urllib.error.URLError,
         TimeoutError,
         ValueError,
         json.JSONDecodeError,
+        RuntimeError,
     ) as exc:
-        raise RuntimeError(f"live hardware snapshot unavailable: {exc}") from exc
-    if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
-        raise RuntimeError("live hardware snapshot returned invalid response")
-    data = payload["data"]
-    _live_snapshot_cache = (monotonic_now, data)
-    return data
+        errors.append(f"latest: {exc}")
+
+    # 2) optional full snapshot (short timeout) — prefer when history richer
+    live_request = urllib.request.Request(
+        LIVE_SNAPSHOT_URL,
+        headers={"Accept": "application/json", "User-Agent": "coldchain-backend/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(live_request, timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
+            raise RuntimeError("live hardware snapshot returned invalid response")
+        data = payload["data"]
+        # 若完整快照历史偏少，用 device/history 补齐
+        history_by_task = data.get("telemetry_history_by_task") or {}
+        max_hist = max((len(v or []) for v in history_by_task.values()), default=0)
+        if latest_data and max_hist < 5:
+            for key, items in (latest_data.get("telemetry_history_by_task") or {}).items():
+                if len(items or []) > len(history_by_task.get(key) or []):
+                    history_by_task[key] = items
+            data["telemetry_history_by_task"] = history_by_task
+            if not data.get("latest_telemetry_by_task"):
+                data["latest_telemetry_by_task"] = latest_data.get(
+                    "latest_telemetry_by_task"
+                )
+        _live_snapshot_cache = (monotonic_now, data)
+        return data
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        json.JSONDecodeError,
+        RuntimeError,
+    ) as exc:
+        errors.append(f"snapshot: {exc}")
+
+    if latest_data:
+        _live_snapshot_cache = (monotonic_now, latest_data)
+        return latest_data
+
+    raise RuntimeError(
+        "live hardware snapshot unavailable: " + " | ".join(errors)
+    )
 
 
 def qr_image_data_url(payload: str) -> Optional[str]:
@@ -730,6 +1036,10 @@ def init_db() -> None:
         ensure_column(conn, "event_log", "acknowledged_at", "TEXT")
         ensure_column(conn, "event_log", "resolved_at", "TEXT")
         ensure_column(conn, "event_log", "resolution", "TEXT")
+        ensure_column(conn, "event_log", "source", "TEXT")
+        ensure_column(conn, "event_log", "source_event_id", "INTEGER")
+        ensure_column(conn, "event_log", "responsible_user_id", "INTEGER")
+        ensure_column(conn, "event_log", "responsible_role", "TEXT")
         ensure_column(conn, "task_handoff", "device_id", "TEXT")
         ensure_column(conn, "task_handoff", "rejected_at", "TEXT")
         ensure_column(conn, "task_handoff", "rejection_reason", "TEXT")
@@ -792,6 +1102,9 @@ def migrate_task_status_column(conn: sqlite3.Connection) -> None:
 
 
 def ensure_demo_task(conn: sqlite3.Connection) -> None:
+    """仅在 SEED_DEMO_TASK=true 时写入 TASK-001（单测/旧看板）；正式环境不种演示单。"""
+    if not SEED_DEMO_TASK:
+        return
     row = conn.execute(
         "SELECT task_id, device_id FROM task_handoff WHERE task_id = ?",
         (DEMO_TASK["task_id"],),
@@ -849,6 +1162,9 @@ app = FastAPI(
     title="Cold Chain Traceability Backend",
     version="0.3.0",
     lifespan=lifespan,
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
 )
 
 
@@ -874,6 +1190,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def light_box_open_threshold() -> int:
+    return int(os.environ.get("LIGHT_BOX_OPEN_THRESHOLD", "5000"))
+
+
+def light_box_close_threshold() -> int:
+    return int(os.environ.get("LIGHT_BOX_CLOSE_THRESHOLD", "6000"))
+
+
+def normalize_box_status(value: Optional[str]) -> str:
+    box_status = str(value or "BOX_CLOSED").upper()
+    return {
+        "CLOSED": "BOX_CLOSED",
+        "OPEN": "BOX_OPEN",
+        "BOX_CLOSED": "BOX_CLOSED",
+        "BOX_OPEN": "BOX_OPEN",
+    }.get(box_status, box_status)
+
+
+def resolve_box_status_from_light(
+    light_raw: Optional[int | float],
+    reported: Optional[str] = None,
+) -> str:
+    """按光敏重判箱体状态。暗高亮低：raw 越低越亮（开箱），raw 越高越暗（关箱）。"""
+    reported_status = normalize_box_status(reported)
+    if not _env_flag("LIGHT_BOX_STATUS_OVERRIDE", "true"):
+        return reported_status
+    if light_raw is None:
+        return reported_status
+    try:
+        value = float(light_raw)
+    except (TypeError, ValueError):
+        return reported_status
+    open_threshold = light_box_open_threshold()
+    close_threshold = max(light_box_close_threshold(), open_threshold)
+    if value < open_threshold:
+        return "BOX_OPEN"
+    if value > close_threshold:
+        return "BOX_CLOSED"
+    return reported_status
+
+
+def apply_light_box_status(data: DeviceDataIn) -> DeviceDataIn:
+    resolved = resolve_box_status_from_light(data.light_raw, data.box_status)
+    if normalize_box_status(data.box_status) == resolved:
+        return data
+    return data.model_copy(update={"box_status": resolved})
 
 
 def detect_event(data: DeviceDataIn) -> str:
@@ -920,7 +1284,7 @@ def build_event_items(
     if move_status == "FREE_FALL":
         events.append(("FREE_FALL", "疑似跌落", "三轴加速度检测到疑似自由落体"))
     if temp_status == "TEMP_ALERT":
-        events.append(("TEMP_ALERT", "温度异常", "温度超出当前演示阈值"))
+        events.append(("TEMP_ALERT", "温度异常", "温度超出设定阈值"))
 
     if event_type == "SEVERE" and len(events) >= 2:
         events.append(("SEVERE", "综合严重异常", "同一条数据触发多个异常条件"))
@@ -1011,6 +1375,65 @@ def insert_alarm_event(
         )
 
 
+def resolve_inbound_task_id(
+    conn: sqlite3.Connection,
+    device_id: str,
+    reported_task_id: str,
+) -> str:
+    """硬件常写死 TASK-001：有绑定/真实在途运单时改写为当前运单号再落库。
+
+    - 设备已 bind → 一律归属 current_task_id
+    - 上报为演示单 TASK-001 且另有非演示在途单占用该设备 → 归属该运单
+    - 其它显式 task_id 不改写（避免误吞测试/其它任务数据）
+    """
+    if not device_id:
+        return reported_task_id
+
+    device = conn.execute(
+        "SELECT current_task_id FROM devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+    bound_id = (device["current_task_id"] if device else None) or None
+    if bound_id:
+        bound_row = get_task_by_id(conn, bound_id)
+        if bound_row:
+            status = canonical_task_status(row_to_dict(bound_row))
+            if status not in TERMINAL_TASK_STATUSES:
+                return bound_id
+
+    if reported_task_id != DEMO_TASK["task_id"]:
+        return reported_task_id
+
+    ranked: list[tuple[int, str]] = []
+    claim_rows = conn.execute(
+        """
+        SELECT * FROM task_handoff
+        WHERE device_id = ?
+        ORDER BY updated_at DESC
+        """,
+        (device_id,),
+    ).fetchall()
+    for row in claim_rows:
+        task = row_to_dict(row)
+        task_id = str(task.get("task_id") or "")
+        if not task_id or task_id == DEMO_TASK["task_id"]:
+            continue
+        status = canonical_task_status(task)
+        if status not in ACTIVE_INGEST_TASK_STATUSES:
+            continue
+        rank = 10
+        if status in {"in_transit", "arrived"}:
+            rank = 1
+        elif status == "pending_handoff":
+            rank = 2
+        ranked.append((rank, task_id))
+
+    if ranked:
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        return ranked[0][1]
+    return reported_task_id
+
+
 def save_device_data(
     conn: sqlite3.Connection,
     data: DeviceDataIn,
@@ -1018,6 +1441,10 @@ def save_device_data(
     battery: Optional[int] = None,
     location: Optional[LocationIn] = None,
 ) -> tuple[Optional[sqlite3.Row], Optional[JSONResponse]]:
+    data = apply_light_box_status(data)
+    resolved_task_id = resolve_inbound_task_id(conn, data.device_id, data.task_id)
+    if resolved_task_id != data.task_id:
+        data = data.model_copy(update={"task_id": resolved_task_id})
     timestamp = data.timestamp or now_iso()
     created_at = now_iso()
     event_type = detect_event(data)
@@ -1031,6 +1458,15 @@ def save_device_data(
             status_code=409,
             content={"ok": False, "error": "device does not match task"},
         )
+
+    if location is not None:
+        lat_value = location.lat
+        lng_value = location.lng
+        accuracy_value = location.accuracy
+    else:
+        lat_value = data.lat
+        lng_value = data.lng
+        accuracy_value = data.accuracy
 
     cursor = conn.execute(
         """
@@ -1057,9 +1493,9 @@ def save_device_data(
             created_at,
             sequence,
             battery,
-            location.lat if location else None,
-            location.lng if location else None,
-            location.accuracy if location else None,
+            lat_value,
+            lng_value,
+            accuracy_value,
         ),
     )
     item_id = cursor.lastrowid
@@ -1344,7 +1780,79 @@ def serialize_device(row: sqlite3.Row) -> dict:
 
 
 def can_manage_device(user: dict, device: dict) -> bool:
-    return user["role"] == "admin" or device.get("owner_user_id") == user["user_id"]
+    if user["role"] == "admin":
+        return True
+    return str(device.get("owner_user_id") or "") == str(user.get("user_id") or "")
+
+
+def device_seen_in_live_snapshot(device_id: str) -> bool:
+    try:
+        snapshot = fetch_live_hardware_snapshot()
+    except RuntimeError:
+        return False
+    return any(
+        str(item.get("device_id") or "") == str(device_id)
+        for item in (snapshot.get("latest_telemetry_by_task") or {}).values()
+    )
+
+
+def ensure_device_for_bind(
+    conn: sqlite3.Connection,
+    device_id: str,
+    user: dict,
+) -> Optional[sqlite3.Row]:
+    """绑定前确保本地 devices 有记录。
+
+    仅当 ALLOW_DEVICE_AUTO_REGISTER 开启且公网快照可见该设备时自动登记，
+    不再硬编码演示设备号。
+    """
+    device = conn.execute(
+        "SELECT * FROM devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+    if device:
+        return device
+
+    if not (ALLOW_DEVICE_AUTO_REGISTER and device_seen_in_live_snapshot(device_id)):
+        return None
+
+    timestamp = now_iso()
+    conn.execute(
+        """
+        INSERT INTO devices (
+            device_id, device_name, model, status, current_task_id,
+            battery, last_seen_at, created_at, updated_at, device_secret_hash,
+            owner_user_id, organization
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            device_id,
+            f"冷链终端 {device_id}",
+            "UniKnect",
+            "available",
+            None,
+            None,
+            timestamp,
+            timestamp,
+            timestamp,
+            None,
+            user["user_id"],
+            user.get("organization"),
+        ),
+    )
+    record_audit(
+        conn,
+        "device.auto_register",
+        user_id=user["user_id"],
+        resource_type="device",
+        resource_id=device_id,
+        detail="auto-register from live snapshot",
+    )
+    return conn.execute(
+        "SELECT * FROM devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
 
 
 def can_view_device(conn: sqlite3.Connection, user: dict, device: dict) -> bool:
@@ -1897,20 +2405,110 @@ def generate_task_id(conn: sqlite3.Connection) -> str:
 
 def can_view_task(user: Optional[dict], task: dict) -> bool:
     if not user:
-        return task["task_id"] == DEMO_TASK["task_id"]
+        return False
     if user["role"] == "admin":
         return True
-    if task.get("owner_user_id") == user["user_id"]:
+    owner = task.get("owner_user_id")
+    carrier = task.get("carrier_user_id")
+    receiver = task.get("receiver_user_id")
+    user_id = user["user_id"]
+    if owner is not None and str(owner) == str(user_id):
         return True
-    if task.get("carrier_user_id") == user["user_id"]:
+    if carrier is not None and str(carrier) == str(user_id):
         return True
-    if task.get("receiver_user_id") == user["user_id"]:
+    if receiver is not None and str(receiver) == str(user_id):
         return True
     return False
 
 
+def is_seed_demo_task(task_id: Optional[str]) -> bool:
+    """仅 SEED_DEMO_TASK 开启时对 TASK-001 放宽校验；生产默认关闭。"""
+    return bool(SEED_DEMO_TASK and task_id == DEMO_TASK["task_id"])
+
+
+def require_legacy_demo_api():
+    if ENABLE_LEGACY_DEMO_API:
+        return None
+    return api_error(404, 40400, "legacy demo api disabled")
+
+
+def live_telemetry_for_task(task: dict) -> tuple[Optional[dict], list[dict]]:
+    """本地库无遥测时，从公网 live-snapshot 按 task_id / device_id 回退。"""
+    try:
+        snapshot = fetch_live_hardware_snapshot()
+    except RuntimeError:
+        return None, []
+    task_id = str(task.get("task_id") or "")
+    device_id = str(task.get("device_id") or "")
+    latest_by_task = snapshot.get("latest_telemetry_by_task") or {}
+    latest = latest_by_task.get(task_id)
+    if not latest and device_id:
+        latest = next(
+            (
+                item
+                for item in latest_by_task.values()
+                if str(item.get("device_id") or "") == device_id
+            ),
+            None,
+        )
+    history_by_task = snapshot.get("telemetry_history_by_task") or {}
+    history = list(history_by_task.get(task_id) or [])
+    if not history and device_id:
+        history = [
+            item
+            for items in history_by_task.values()
+            for item in (items or [])
+            if str(item.get("device_id") or "") == device_id
+        ]
+    return latest, history
+
+
 def can_modify_task(user: dict, task: dict) -> bool:
-    return user["role"] == "admin" or task.get("owner_user_id") == user["user_id"]
+    return user["role"] == "admin" or str(task.get("owner_user_id") or "") == str(
+        user["user_id"]
+    )
+
+
+def task_custody_owner(task: dict) -> dict:
+    """按运单状态返回当前责任主体（与追溯页一致）。"""
+    status = canonical_task_status(task)
+    if status == "signed":
+        return {
+            "role": "receiver",
+            "user_id": task.get("receiver_user_id"),
+            "label": "接收",
+            "name": task.get("receiver") or "接收方",
+        }
+    if status in {"in_transit", "arrived"}:
+        return {
+            "role": "carrier",
+            "user_id": task.get("carrier_user_id"),
+            "label": "承运",
+            "name": task.get("carrier") or "承运方",
+        }
+    # pending_pack / pending_handoff / rejected / canceled 等：发货方负责
+    return {
+        "role": "owner",
+        "user_id": task.get("owner_user_id"),
+        "label": "发货",
+        "name": task.get("sender") or "发货方",
+    }
+
+
+def can_handle_alarm(user: Optional[dict], task: dict, alarm: Optional[dict] = None) -> bool:
+    """告警由发生时（或当前）责任人处置；管理员可代处置。"""
+    if not user:
+        return False
+    if user["role"] == "admin":
+        return True
+    responsible_id = None
+    if alarm:
+        responsible_id = alarm.get("responsible_user_id")
+    if responsible_id is None:
+        responsible_id = task_custody_owner(task).get("user_id")
+    if responsible_id is None:
+        return False
+    return str(responsible_id) == str(user["user_id"])
 
 
 def canonical_task_status(task: dict) -> str:
@@ -1964,15 +2562,12 @@ def build_handoff_nodes(task: dict) -> list[dict]:
     return nodes
 
 
-def normalize_telemetry(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
-    box_status = item["box_status"].upper()
-    temp_status = item["temp_status"].upper()
-    move_status = item["move_status"].upper()
-    item["box_status"] = {
-        "CLOSED": "BOX_CLOSED",
-        "OPEN": "BOX_OPEN",
-    }.get(box_status, box_status)
+def normalize_telemetry(row: sqlite3.Row | dict) -> dict:
+    item = dict(row) if isinstance(row, dict) else row_to_dict(row)
+    box_status = normalize_box_status(item.get("box_status"))
+    temp_status = str(item.get("temp_status") or "").upper()
+    move_status = str(item.get("move_status") or "").upper()
+    item["box_status"] = resolve_box_status_from_light(item.get("light_raw"), box_status)
     item["move_status"] = move_status
     item["temp_status"] = {
         "NORMAL": "TEMP_OK",
@@ -2002,24 +2597,234 @@ def event_level(event_type: str) -> str:
     return EVENT_LEVELS.get(event_type, "medium")
 
 
-def normalize_event(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
-    item["event_id"] = item["id"]
-    item["description"] = item["event_detail"]
-    item["event_level"] = event_level(item["event_type"])
+def normalize_event(row: sqlite3.Row | dict) -> dict:
+    item = dict(row) if isinstance(row, dict) else row_to_dict(row)
+    if item.get("id") is None and item.get("event_id") is not None:
+        item["id"] = item["event_id"]
+    item["event_id"] = item.get("event_id") or item.get("id")
+    item["description"] = item.get("event_detail") or item.get("description") or ""
+    item["event_level"] = item.get("event_level") or event_level(str(item.get("event_type") or ""))
     item["event_display"] = EVENT_DISPLAY_LABELS.get(
-        item["event_type"],
-        item["event_name"],
+        str(item.get("event_type") or ""),
+        item.get("event_name") or str(item.get("event_type") or ""),
     )
     item["alarm_status"] = item.get("alarm_status") or "new"
+    item["source"] = item.get("source") or "local"
     return item
+
+
+def fetch_live_device_events(limit: int = 100) -> list[dict]:
+    """设备异常事件：本机落库直读；开发机才 HTTP 代理公网。"""
+    if not ENABLE_LIVE_HARDWARE_PROXY:
+        init_db()
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM event_log
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [normalize_event(row) for row in rows]
+    request = urllib.request.Request(
+        LIVE_DEVICE_EVENTS_URL,
+        headers={"Accept": "application/json", "User-Agent": "coldchain-backend/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("items") or payload.get("data") or []
+    else:
+        items = []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)][: max(1, limit)]
+
+
+def _live_alarm_source_event_id(item: dict) -> Optional[int]:
+    raw = item.get("id") if item.get("id") is not None else item.get("event_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def sync_live_alarms_to_local(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    device_id: str,
+    live_items: list[dict],
+    task: Optional[dict] = None,
+) -> int:
+    """
+    公网事件写入本地 event_log，供 ack/resolve 等处置逻辑使用。
+    已存在记录不覆盖本地 alarm_status；新建时写入当时责任人。
+    """
+    if not device_id:
+        return 0
+    custody = task_custody_owner(task or {"task_id": task_id, "status": "in_transit"})
+    responsible_user_id = custody.get("user_id")
+    responsible_role = custody.get("role")
+    created = 0
+    created_at = now_iso()
+    for item in live_items:
+        if str(item.get("device_id") or "") != device_id:
+            continue
+        event_type = str(item.get("event_type") or "").strip()
+        if not event_type:
+            continue
+        timestamp = str(item.get("timestamp") or item.get("created_at") or created_at)
+        event_detail = str(item.get("event_detail") or item.get("description") or "")
+        event_name = str(
+            item.get("event_name")
+            or EVENT_DISPLAY_LABELS.get(event_type)
+            or event_type
+        )
+        source_event_id = _live_alarm_source_event_id(item)
+        existing = None
+        if source_event_id is not None:
+            existing = conn.execute(
+                """
+                SELECT id, responsible_user_id FROM event_log
+                WHERE task_id = ? AND source = 'live' AND source_event_id = ?
+                LIMIT 1
+                """,
+                (task_id, source_event_id),
+            ).fetchone()
+        if existing is None:
+            existing = conn.execute(
+                """
+                SELECT id, responsible_user_id FROM event_log
+                WHERE task_id = ?
+                  AND device_id = ?
+                  AND event_type = ?
+                  AND timestamp = ?
+                  AND event_detail = ?
+                LIMIT 1
+                """,
+                (task_id, device_id, event_type, timestamp, event_detail),
+            ).fetchone()
+        if existing:
+            # 补齐来源与责任人（不覆盖已有责任人）
+            conn.execute(
+                """
+                UPDATE event_log
+                SET source = COALESCE(NULLIF(source, ''), 'live'),
+                    source_event_id = COALESCE(source_event_id, ?),
+                    responsible_user_id = COALESCE(responsible_user_id, ?),
+                    responsible_role = COALESCE(NULLIF(responsible_role, ''), ?)
+                WHERE id = ?
+                """,
+                (
+                    source_event_id,
+                    responsible_user_id,
+                    responsible_role,
+                    existing["id"],
+                ),
+            )
+            continue
+        data_id = item.get("data_id")
+        try:
+            data_id = int(data_id) if data_id is not None else None
+        except (TypeError, ValueError):
+            data_id = None
+        conn.execute(
+            """
+            INSERT INTO event_log (
+                data_id, task_id, device_id, event_type, event_name,
+                event_detail, timestamp, created_at, alarm_status,
+                source, source_event_id, responsible_user_id, responsible_role
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data_id,
+                task_id,
+                device_id,
+                event_type,
+                event_name,
+                event_detail,
+                timestamp,
+                created_at,
+                "new",
+                "live",
+                source_event_id,
+                responsible_user_id,
+                responsible_role,
+            ),
+        )
+        created += 1
+    return created
+
+
+def merge_task_alarms(
+    local_items: list[dict],
+    live_items: list[dict],
+    *,
+    task_id: str,
+    device_id: str,
+    limit: int,
+) -> list[dict]:
+    """本地 event_log + 公网同设备事件去重合并。"""
+    merged: list[dict] = []
+    seen: set[str] = set()
+
+    def key_of(item: dict) -> str:
+        return "|".join(
+            [
+                str(item.get("device_id") or ""),
+                str(item.get("event_type") or ""),
+                str(item.get("timestamp") or item.get("created_at") or ""),
+                str(item.get("event_detail") or item.get("description") or ""),
+            ]
+        )
+
+    for item in local_items:
+        normalized = normalize_event(item)
+        normalized["source"] = "local"
+        normalized["task_id"] = task_id
+        seen.add(key_of(normalized))
+        merged.append(normalized)
+
+    for item in live_items:
+        if device_id and str(item.get("device_id") or "") != device_id:
+            continue
+        normalized = normalize_event(item)
+        normalized["source"] = "live"
+        # 展示归属当前运单，便于小程序按 task_id 打开详情
+        normalized["task_id"] = task_id
+        fingerprint = key_of(normalized)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        # 公网 id 可能与本地冲突：用负数段避免覆盖本地告警 id
+        raw_id = normalized.get("id") or normalized.get("event_id") or 0
+        try:
+            raw_id = int(raw_id)
+        except (TypeError, ValueError):
+            raw_id = abs(hash(fingerprint)) % 100000000
+        normalized["id"] = -abs(raw_id) if raw_id >= 0 else raw_id
+        normalized["event_id"] = normalized["id"]
+        merged.append(normalized)
+
+    merged.sort(
+        key=lambda item: str(item.get("timestamp") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    return merged[:limit]
 
 
 def task_latest_telemetry(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
     row = conn.execute(
         """
         SELECT * FROM device_data
-        WHERE task_id = ? ORDER BY id DESC LIMIT 1
+        WHERE task_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1
         """,
         (task_id,),
     ).fetchone()
@@ -2033,11 +2838,37 @@ def task_abnormal_count(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchone()["count"]
 
 
-def enrich_task(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
+def enrich_task(
+    row: sqlite3.Row,
+    conn: sqlite3.Connection,
+    live_by_device: Optional[dict[str, dict]] = None,
+) -> dict:
     task = serialize_task(row)
     task_id = task["task_id"]
+    device_id = str(task.get("device_id") or "")
     latest = task_latest_telemetry(conn, task_id)
+    if not latest and device_id:
+        device_row = conn.execute(
+            """
+            SELECT * FROM device_data
+            WHERE device_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (device_id,),
+        ).fetchone()
+        latest = normalize_telemetry(device_row) if device_row else None
+    if not latest and live_by_device and device_id:
+        live_item = live_by_device.get(device_id)
+        if live_item:
+            latest = normalize_telemetry(live_item)
     task["abnormal_count"] = task_abnormal_count(conn, task_id)
+    min_temp = task.get("temperature_min")
+    max_temp = task.get("temperature_max")
+    if min_temp is not None and max_temp is not None:
+        task["temperature_range"] = f"{min_temp}~{max_temp}℃"
+    elif not task.get("temperature_range"):
+        task["temperature_range"] = None
     if latest:
         task["latest_temperature"] = latest["temperature"]
         task["latest_humidity"] = latest["humidity"]
@@ -2051,6 +2882,20 @@ def enrich_task(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
         task["latest_move_status"] = None
         task["latest_temp_status"] = None
     return task
+
+
+def live_telemetry_index_by_device() -> dict[str, dict]:
+    """一次拉取公网最新值，按 device_id 索引，供任务列表补全实测温度。"""
+    try:
+        snapshot = fetch_live_hardware_snapshot()
+    except RuntimeError:
+        return {}
+    index: dict[str, dict] = {}
+    for item in (snapshot.get("latest_telemetry_by_task") or {}).values():
+        device_id = str(item.get("device_id") or "")
+        if device_id and device_id not in index:
+            index[device_id] = item
+    return index
 
 
 def legacy_task_view(task: dict) -> dict:
@@ -2068,7 +2913,7 @@ def get_trace_report_data(conn: sqlite3.Connection, task_id: str) -> dict:
         """
         SELECT * FROM device_data
         WHERE task_id = ?
-        ORDER BY id DESC
+        ORDER BY timestamp DESC, id DESC
         LIMIT 1
         """,
         (task_id,),
@@ -2148,6 +2993,9 @@ def get_trace_report_data(conn: sqlite3.Connection, task_id: str) -> dict:
 
 @app.post("/api/device/data")
 def receive_device_data(data: DeviceDataIn):
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         row, error = save_device_data(conn, data)
@@ -2159,6 +3007,9 @@ def receive_device_data(data: DeviceDataIn):
 
 @app.get("/api/device/latest")
 def get_latest_device_data() -> dict:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         row = conn.execute(
@@ -2169,6 +3020,9 @@ def get_latest_device_data() -> dict:
 
 @app.get("/api/device/history")
 def get_device_history() -> list[dict]:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         rows = conn.execute(
@@ -2179,6 +3033,9 @@ def get_device_history() -> list[dict]:
 
 @app.get("/api/device/events")
 def get_device_events() -> list[dict]:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         rows = conn.execute(
@@ -2194,6 +3051,9 @@ def get_device_events() -> list[dict]:
 
 @app.post("/api/task/start")
 def start_task() -> dict:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     timestamp = now_iso()
     with get_connection() as conn:
@@ -2217,6 +3077,9 @@ def start_task() -> dict:
 
 @app.post("/api/task/sign")
 def sign_task() -> dict:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         ensure_demo_task(conn)
@@ -2240,6 +3103,9 @@ def sign_task() -> dict:
 
 @app.get("/api/task/current")
 def get_current_task() -> dict:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         row = get_task_row(conn)
@@ -2248,6 +3114,9 @@ def get_current_task() -> dict:
 
 @app.get("/api/task/report")
 def get_task_report() -> dict:
+    disabled = require_legacy_demo_api()
+    if disabled:
+        return disabled
     init_db()
     with get_connection() as conn:
         task = legacy_task_view(enrich_task(get_task_row(conn), conn))
@@ -2630,9 +3499,12 @@ def receive_v1_device_telemetry(
             "SELECT current_task_id FROM devices WHERE device_id = ?",
             (payload.device_id,),
         ).fetchone()
-        if not device or device["current_task_id"] != payload.task_id:
+        resolved_task_id = resolve_inbound_task_id(
+            conn, payload.device_id, payload.task_id
+        )
+        if not device or device["current_task_id"] != resolved_task_id:
             return api_error(409, 40920, "device does not match task")
-        task = get_task_by_id(conn, payload.task_id)
+        task = get_task_by_id(conn, resolved_task_id)
         if payload.sequence is not None:
             existing = conn.execute(
                 """
@@ -2645,7 +3517,7 @@ def receive_v1_device_telemetry(
                 update_device_seen(
                     conn,
                     payload.device_id,
-                    payload.task_id,
+                    resolved_task_id,
                     payload.battery,
                     now_iso(),
                 )
@@ -2659,7 +3531,7 @@ def receive_v1_device_telemetry(
                 )
         data = DeviceDataIn(
             device_id=payload.device_id,
-            task_id=payload.task_id,
+            task_id=resolved_task_id,
             temperature=payload.temperature,
             humidity=payload.humidity,
             light_raw=payload.light_raw,
@@ -2684,7 +3556,7 @@ def receive_v1_device_telemetry(
         update_device_seen(
             conn,
             payload.device_id,
-            payload.task_id,
+            resolved_task_id,
             payload.battery,
             now_iso(),
         )
@@ -2879,10 +3751,7 @@ def bind_v1_device(
         if not can_modify_task(user, task):
             return api_error(404, 40401, "task not found")
 
-        device = conn.execute(
-            "SELECT * FROM devices WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()
+        device = ensure_device_for_bind(conn, device_id, user)
         if not device:
             return api_error(404, 40402, "device not found")
         device_data = row_to_dict(device)
@@ -3119,8 +3988,9 @@ def list_v1_tasks(
         rows = conn.execute(
             "SELECT * FROM task_handoff ORDER BY updated_at DESC"
         ).fetchall()
+        live_by_device = live_telemetry_index_by_device()
         tasks = [
-            enrich_task(row, conn)
+            enrich_task(row, conn, live_by_device)
             for row in rows
             if can_view_task(user, serialize_task(row))
         ]
@@ -3428,6 +4298,59 @@ def cancel_v1_task(
         )
         updated = get_task_by_id(conn, task_id)
     return api_success(enrich_task(updated, conn), "task canceled")
+
+
+def purge_task_records(conn: sqlite3.Connection, task_id: str) -> None:
+    """硬删除运单及其关联记录（运输开始前的测试单清理）。"""
+    tables = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
+    for table in tables:
+        if table in {"sqlite_sequence", "users", "auth_tokens", "rate_limits"}:
+            continue
+        columns = [
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        if "task_id" not in columns:
+            continue
+        conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+
+
+@app.delete("/api/v1/tasks/{task_id}")
+def delete_v1_task(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if is_seed_demo_task(task_id):
+        return api_error(403, 40303, "demo task cannot be deleted")
+
+    with get_connection() as conn:
+        row = get_task_by_id(conn, task_id)
+        if not row:
+            return api_error(404, 40401, "task not found")
+        task = serialize_task(row)
+        if not can_modify_task(user, task):
+            return api_error(404, 40401, "task not found")
+        if task["status"] not in {"pending_pack", "pending_handoff", "canceled"}:
+            return task_state_conflict()
+        purge_task_records(conn, task_id)
+        record_audit(
+            conn,
+            "task.delete",
+            user_id=user["user_id"],
+            resource_type="task",
+            resource_id=task_id,
+            task_id=None,
+            detail=f"deleted status={task['status']}",
+        )
+    return api_success({"task_id": task_id}, "task deleted")
 
 
 @app.post("/api/v1/tasks/{task_id}/precheck")
@@ -4615,19 +5538,33 @@ def get_v1_latest_telemetry(
     if not user:
         return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
-        task = get_task_by_id(conn, task_id)
-        if not task or not can_view_task(user, serialize_task(task)):
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
             return api_error(404, 40401, "task not found")
+        task = serialize_task(task_row)
         row = conn.execute(
             """
             SELECT * FROM device_data
             WHERE task_id = ?
-            ORDER BY id DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
             (task_id,),
         ).fetchone()
-    return api_success(normalize_telemetry(row) if row else None)
+        if not row and task.get("device_id"):
+            row = conn.execute(
+                """
+                SELECT * FROM device_data
+                WHERE device_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                (task["device_id"],),
+            ).fetchone()
+    if row:
+        return api_success(normalize_telemetry(row))
+    live_latest, _ = live_telemetry_for_task(task)
+    return api_success(normalize_telemetry(live_latest) if live_latest else None)
 
 
 @app.get("/api/v1/tasks/{task_id}/telemetry/history")
@@ -4647,9 +5584,10 @@ def get_v1_telemetry_history(
     start_time = normalize_query_time(start_time)
     end_time = normalize_query_time(end_time)
     with get_connection() as conn:
-        task = get_task_by_id(conn, task_id)
-        if not task or not can_view_task(user, serialize_task(task)):
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
             return api_error(404, 40401, "task not found")
+        task = serialize_task(task_row)
         conditions = ["task_id = ?"]
         params: list[object] = [task_id]
         if start_time:
@@ -4666,12 +5604,38 @@ def get_v1_telemetry_history(
             f"""
             SELECT * FROM device_data
             WHERE {' AND '.join(conditions)}
-            ORDER BY id DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT ?
             """,
             params,
         ).fetchall()
+        if not rows and task.get("device_id") and not cursor:
+            device_conditions = ["device_id = ?"]
+            device_params: list[object] = [task["device_id"]]
+            if start_time:
+                device_conditions.append("timestamp >= ?")
+                device_params.append(start_time)
+            if end_time:
+                device_conditions.append("timestamp <= ?")
+                device_params.append(end_time)
+            device_params.append(limit)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM device_data
+                WHERE {' AND '.join(device_conditions)}
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                device_params,
+            ).fetchall()
     items = [normalize_telemetry(row) for index, row in enumerate(rows)]
+    if not items and not cursor:
+        _, live_history = live_telemetry_for_task(task)
+        items = [normalize_telemetry(item) for item in live_history[:limit]]
+        if start_time:
+            items = [item for item in items if str(item.get("timestamp") or "") >= start_time]
+        if end_time:
+            items = [item for item in items if str(item.get("timestamp") or "") <= end_time]
     if downsample > 1:
         items = [item for index, item in enumerate(items) if index % downsample == 0]
     return api_success(
@@ -4698,21 +5662,80 @@ def get_v1_alarms(
     if not user:
         return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
-        task = get_task_by_id(conn, task_id)
-        if not task or not can_view_task(user, serialize_task(task)):
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
             return api_error(404, 40401, "task not found")
-        ensure_task_offline_alarm(conn, task)
+        task = serialize_task(task_row)
+        device_id = str(task.get("device_id") or "")
+
+        live_items: list[dict] = []
+        if device_id:
+            try:
+                live_items = fetch_live_device_events(max(limit, 100))
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ValueError,
+                json.JSONDecodeError,
+                RuntimeError,
+            ):
+                live_items = []
+            try:
+                snapshot = fetch_live_hardware_snapshot()
+                for item in snapshot.get("recent_alarms") or []:
+                    if isinstance(item, dict):
+                        live_items.append(item)
+            except RuntimeError:
+                pass
+            sync_live_alarms_to_local(
+                conn,
+                task_id=task_id,
+                device_id=device_id,
+                live_items=live_items,
+                task=task,
+            )
+
+        # 公网事件同步进本地后，与本地入库告警一并返回（处置走本地逻辑）
         rows = conn.execute(
             """
             SELECT * FROM event_log
             WHERE task_id = ?
-            ORDER BY id DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT ?
             """,
             (task_id, limit),
         ).fetchall()
+        custody = task_custody_owner(task)
+        items = []
+        for row in rows:
+            item = normalize_event(row)
+            item["source"] = item.get("source") or "local"
+            if item.get("responsible_user_id") is None:
+                item["responsible_user_id"] = custody.get("user_id")
+                item["responsible_role"] = custody.get("role")
+            role = item.get("responsible_role") or custody.get("role")
+            if role == "carrier":
+                item["responsible_label"] = "承运"
+                item["responsible_name"] = task.get("carrier") or "承运方"
+            elif role == "receiver":
+                item["responsible_label"] = "接收"
+                item["responsible_name"] = task.get("receiver") or "接收方"
+            else:
+                item["responsible_label"] = "发货"
+                item["responsible_name"] = task.get("sender") or "发货方"
+            item["can_handle"] = can_handle_alarm(user, task, item)
+            items.append(item)
+
     return api_success(
-        {"limit": limit, "items": [normalize_event(row) for row in rows]}
+        {
+            "limit": limit,
+            "device_id": device_id or None,
+            "items": items,
+            "source": {
+                "local": sum(1 for item in items if item.get("source") != "live"),
+                "live": sum(1 for item in items if item.get("source") == "live"),
+            },
+        }
     )
 
 
@@ -4725,8 +5748,6 @@ def ack_v1_alarm(
     user = require_user(authorization)
     if not user:
         return api_error(401, 40102, "unauthorized")
-    if user["role"] != "admin":
-        return api_error(403, 40301, "forbidden")
     timestamp = now_iso()
     with get_connection() as conn:
         row = conn.execute(
@@ -4735,6 +5756,32 @@ def ack_v1_alarm(
         ).fetchone()
         if not row:
             return api_error(404, 40403, "alarm not found")
+        alarm = normalize_event(row)
+        task_row = get_task_by_id(conn, alarm["task_id"])
+        if not task_row:
+            return api_error(404, 40401, "task not found")
+        task = serialize_task(task_row)
+        if not can_view_task(user, task):
+            return api_error(404, 40403, "alarm not found")
+        if alarm.get("responsible_user_id") is None:
+            custody = task_custody_owner(task)
+            conn.execute(
+                """
+                UPDATE event_log
+                SET responsible_user_id = ?, responsible_role = ?
+                WHERE id = ? AND responsible_user_id IS NULL
+                """,
+                (custody.get("user_id"), custody.get("role"), alarm_id),
+            )
+            alarm["responsible_user_id"] = custody.get("user_id")
+            alarm["responsible_role"] = custody.get("role")
+        if not can_handle_alarm(user, task, alarm):
+            custody = task_custody_owner(task)
+            return api_error(
+                403,
+                40301,
+                f"仅责任人可处置（{custody.get('label')} · {custody.get('name')}）",
+            )
         conn.execute(
             """
             UPDATE event_log
@@ -4768,8 +5815,6 @@ def resolve_v1_alarm(
     user = require_user(authorization)
     if not user:
         return api_error(401, 40102, "unauthorized")
-    if user["role"] != "admin":
-        return api_error(403, 40301, "forbidden")
     timestamp = now_iso()
     with get_connection() as conn:
         row = conn.execute(
@@ -4778,6 +5823,32 @@ def resolve_v1_alarm(
         ).fetchone()
         if not row:
             return api_error(404, 40403, "alarm not found")
+        alarm = normalize_event(row)
+        task_row = get_task_by_id(conn, alarm["task_id"])
+        if not task_row:
+            return api_error(404, 40401, "task not found")
+        task = serialize_task(task_row)
+        if not can_view_task(user, task):
+            return api_error(404, 40403, "alarm not found")
+        if alarm.get("responsible_user_id") is None:
+            custody = task_custody_owner(task)
+            conn.execute(
+                """
+                UPDATE event_log
+                SET responsible_user_id = ?, responsible_role = ?
+                WHERE id = ? AND responsible_user_id IS NULL
+                """,
+                (custody.get("user_id"), custody.get("role"), alarm_id),
+            )
+            alarm["responsible_user_id"] = custody.get("user_id")
+            alarm["responsible_role"] = custody.get("role")
+        if not can_handle_alarm(user, task, alarm):
+            custody = task_custody_owner(task)
+            return api_error(
+                403,
+                40301,
+                f"仅责任人可处置（{custody.get('label')} · {custody.get('name')}）",
+            )
         conn.execute(
             """
             UPDATE event_log
@@ -5078,7 +6149,7 @@ def start_v1_task(
         task = serialize_task(row)
         if not can_modify_task(user, task):
             return api_error(404, 40401, "task not found")
-        if task_id != DEMO_TASK["task_id"] and (
+        if not is_seed_demo_task(task_id) and (
             task["status"] != "pending_handoff"
             or not task.get("carrier_user_id")
             or not task.get("receiver_user_id")
@@ -5201,7 +6272,7 @@ def sign_v1_task(
         task = serialize_task(row)
         if user["role"] != "admin" and task.get("receiver_user_id") != user["user_id"]:
             return api_error(404, 40401, "task not found")
-        if task_id != DEMO_TASK["task_id"]:
+        if not is_seed_demo_task(task_id):
             confirmed_handoff = conn.execute(
                 """
                 SELECT id FROM handoffs
@@ -5280,7 +6351,7 @@ def reject_v1_task(
         task = serialize_task(row)
         if user["role"] != "admin" and task.get("receiver_user_id") != user["user_id"]:
             return api_error(404, 40401, "task not found")
-        if task_id != DEMO_TASK["task_id"]:
+        if not is_seed_demo_task(task_id):
             qr_evidence = conn.execute(
                 """
                 SELECT qr_tokens.id
@@ -5464,7 +6535,7 @@ def precheck_v1_device(
         hardware_error = str(exc)
     with get_connection() as conn:
         local_row = conn.execute(
-            "SELECT * FROM device_data WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM device_data WHERE device_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1",
             (device_id,),
         ).fetchone()
     selected_local_row = local_row if allow_local else None
@@ -5555,7 +6626,7 @@ def simulate_v1_device_reading(
     user = require_user(authorization)
     if not user:
         return api_error(401, 40102, "unauthorized")
-    if os.environ.get("ALLOW_LOCAL_SIMULATION", "0") != "1":
+    if not ALLOW_LOCAL_SIMULATION:
         return api_error(403, 40301, "local simulation disabled")
     with get_connection() as conn:
         device_row = conn.execute(
@@ -5595,7 +6666,7 @@ def simulate_v1_face(
     user = require_user(authorization)
     if not user:
         return api_error(401, 40102, "unauthorized")
-    if os.environ.get("ALLOW_LOCAL_SIMULATION", "0") != "1":
+    if not ALLOW_LOCAL_SIMULATION:
         return api_error(403, 40301, "local simulation disabled")
     timestamp = now_iso()
     with get_connection() as conn:
@@ -5648,6 +6719,22 @@ def simulate_v1_face(
         }
     )
     return api_success(result, "local face simulation verified")
+
+
+@app.get("/api/v1/admin/live-snapshot")
+def get_v1_admin_live_snapshot(
+    telemetry_limit: int = Query(default=20, ge=1, le=100),
+    alarm_limit: int = Query(default=50, ge=1, le=200),
+    device_history_limit: int = Query(default=50, ge=1, le=200),
+):
+    """公网联调只读快照：读取本机 SQLite（8080 机即为硬件上报落库，不做自拉）。"""
+    return api_success(
+        build_local_hardware_snapshot(
+            telemetry_limit=telemetry_limit,
+            alarm_limit=alarm_limit,
+            device_history_limit=device_history_limit,
+        )
+    )
 
 
 @app.get("/api/v1/tasks/{task_id}/hardware/snapshot")
@@ -5717,7 +6804,9 @@ def get_v1_task_hardware_snapshot(
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
+def dashboard():
+    if not ENABLE_DEMO_DASHBOARD:
+        return HTMLResponse("demo dashboard disabled", status_code=404)
     return """
 <!doctype html>
 <html lang="zh-CN">
@@ -5967,3 +7056,9 @@ def dashboard() -> str:
 </body>
 </html>
 """
+
+
+@app.get("/home", response_class=HTMLResponse)
+def dashboard_home() -> str:
+    """兼容入口 http://host:port/home 。"""
+    return dashboard()

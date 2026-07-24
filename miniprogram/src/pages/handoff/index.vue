@@ -4,6 +4,7 @@ import { onLoad, onUnload } from '@dcloudio/uni-app'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import StatePanel from '@/components/StatePanel.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import RouteTrackCard from '@/components/RouteTrackCard.vue'
 import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
 import { useSessionStore } from '@/stores/session'
@@ -14,6 +15,7 @@ const sessionStore = useSessionStore()
 const taskId = ref('')
 const task = ref<Task | null>(null)
 const telemetry = ref<Telemetry | null>(null)
+const history = ref<Telemetry[]>([])
 const qr = ref<HandoffQr | null>(null)
 const handoff = ref<HandoffSession | null>(null)
 const note = ref('')
@@ -77,6 +79,10 @@ const primaryDisabled = computed(() => {
   if (isIssuer.value) return true
   return recipientVerified.value && !ready.value
 })
+const trackItems = computed(() => {
+  if (history.value.length) return history.value
+  return telemetry.value ? [telemetry.value] : []
+})
 
 async function loadTask() {
   task.value = await taskService.getTask(taskId.value)
@@ -85,21 +91,32 @@ async function loadTask() {
 
 async function refreshTelemetry() {
   if (!task.value) return
-  const [hardware, local] = await Promise.all([
+  const [hardware, local, historyData] = await Promise.all([
     taskService.getHardwareSnapshot(task.value.task_id).catch(() => null),
-    taskService.getLatestTelemetry(task.value.task_id).catch(() => null),
+    taskService.getLatestTelemetry(task.value.task_id, { showLoading: false }).catch(() => null),
+    taskService.getTelemetryHistory(task.value.task_id, 100, { showLoading: false }).catch(() => ({ items: [] as Telemetry[] })),
   ])
+  history.value = historyData.items || []
   if (hardware?.matched && hardware.latest) {
     telemetry.value = hardware.latest
+    if (hardware.history?.length) history.value = hardware.history
     telemetrySource.value = 'hardware'
     telemetryMessage.value = `真实硬件实时数据 · ${hardware.matched_by === 'task_id' ? '任务匹配' : '设备匹配'}`
     return
   }
+  // 硬件快照超时/失败时，latest 接口仍可能通过公网 device/latest 回退拿到数据
   telemetry.value = local
-  telemetrySource.value = local ? 'local' : 'none'
+  if (local) {
+    telemetrySource.value = hardware ? 'local' : 'hardware'
+    telemetryMessage.value = hardware
+      ? `真实接口在线，但未匹配到任务 ${task.value.task_id}；已显示设备最新数据`
+      : '真实硬件实时数据 · 设备最新值'
+    return
+  }
+  telemetrySource.value = 'none'
   telemetryMessage.value = hardware
-    ? `真实接口在线，但未找到任务 ${task.value.task_id} / 设备 ${task.value.device_id} 的数据`
-    : '真实硬件接口暂不可用，当前使用本地后端数据'
+    ? `真实接口在线，但未找到任务 ${task.value.task_id} / 设备 ${task.value.device_id || '未绑定'} 的数据`
+    : '真实硬件接口暂时超时，请下拉刷新或稍后重试'
 }
 
 async function simulateInitialTelemetry() {
@@ -399,6 +416,13 @@ onUnload(() => {
         <view class="check-row"><view class="check-icon" :class="{warning:!recipientVerified}">{{ recipientVerified?'✓':'!' }}</view><view class="check-content"><view class="check-label">{{ isArrivalHandoff ? '接收人员' : '承运人员' }}</view><view class="check-value">{{ isArrivalHandoff ? task.receiver : task.carrier }} · {{ recipientVerified?'身份已核验':'等待扫码' }}</view></view></view>
         <view class="check-row"><view class="check-icon" :class="{ warning: !telemetry }">{{ telemetry ? '✓' : '!' }}</view><view class="check-content"><view class="check-label">初始设备数据 <text v-if="telemetrySource !== 'none'" class="source-tag" :class="telemetrySource">{{ telemetrySource === 'hardware' ? '真实硬件' : '本地测试' }}</text></view><view v-if="telemetry" class="check-value">{{ telemetry.temperature }}℃ · 湿度 {{ telemetry.humidity }}% · {{ telemetry.box_status }}</view><view v-else class="check-value warning-text">暂无匹配数据，请确认设备状态</view><view v-if="telemetryMessage" class="test-hint">{{ telemetryMessage }}</view><view v-if="isLocalSimulation && !telemetry" class="test-hint">无硬件联调时，可生成一条绑定到当前运单的正常数据。</view></view><button v-if="isLocalSimulation && !telemetry" class="telemetry-test" :disabled="telemetryBusy" @tap="simulateInitialTelemetry">{{ telemetryBusy ? '生成中…' : '生成测试数据' }}</button></view>
       </view>
+
+      <RouteTrackCard
+        :title="isArrivalHandoff ? '发出 / 交接位置与轨迹' : '设备位置'"
+        :items="trackItems"
+        :stage="isArrivalHandoff ? 'transit' : 'send'"
+        :departed="isArrivalHandoff"
+      />
 
       <view class="card note-card"><view class="section-heading"><view class="section-title">交接备注</view><view class="section-hint">将上传并留痕</view></view><textarea v-model="note" maxlength="200" placeholder="记录本次交接需要说明的事项…" class="textarea" /><view class="note-footer"><text>随交接记录保存</text><text>{{ note.length }}/200</text></view></view>
 

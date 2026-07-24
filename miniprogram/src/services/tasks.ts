@@ -155,15 +155,34 @@ export const taskService = {
   }),
   getEvidenceFile: (fileId: string) => request<EvidenceFile>(`/api/v1/files/${encodeURIComponent(fileId)}`),
   getContracts: () => appConfig.useMock ? mockContracts() : request<ContractMeta>('/api/v1/meta/contracts'),
-  getTask: async (taskId: string) => appConfig.useMock ? mockGetTask(taskId) : normalizeTask(await request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}`)),
-  getLatestTelemetry: (taskId: string) => appConfig.useMock ? mockLatest(taskId) : request<Telemetry | null>(`/api/v1/tasks/${encodeURIComponent(taskId)}/telemetry/latest`),
-  getHardwareSnapshot: (taskId: string) => request<HardwareSnapshot>(`/api/v1/tasks/${encodeURIComponent(taskId)}/hardware/snapshot`, { showLoading: false }),
-  getTelemetryHistory: (taskId: string, limit = 100) => appConfig.useMock ? mockHistory(taskId, limit) : request<PagedResult<Telemetry>>(`/api/v1/tasks/${encodeURIComponent(taskId)}/telemetry/history?limit=${limit}`),
-  getAlarms: (taskId: string, limit = 100) => appConfig.useMock ? mockAlarms(taskId, limit) : request<PagedResult<AlarmEvent>>(`/api/v1/tasks/${encodeURIComponent(taskId)}/alarms?limit=${limit}`),
+  getTask: async (taskId: string, opts: { showLoading?: boolean } = {}) => appConfig.useMock ? mockGetTask(taskId) : normalizeTask(await request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, opts)),
+  getLatestTelemetry: (taskId: string, opts: { showLoading?: boolean } = {}) => appConfig.useMock ? mockLatest(taskId) : request<Telemetry | null>(`/api/v1/tasks/${encodeURIComponent(taskId)}/telemetry/latest`, { ...opts, timeout: 20000 }),
+  getHardwareSnapshot: (taskId: string) => request<HardwareSnapshot>(`/api/v1/tasks/${encodeURIComponent(taskId)}/hardware/snapshot`, { showLoading: false, timeout: 20000 }),
+  getTelemetryHistory: (taskId: string, limit = 100, opts: { showLoading?: boolean } = {}) => appConfig.useMock ? mockHistory(taskId, limit) : request<PagedResult<Telemetry>>(`/api/v1/tasks/${encodeURIComponent(taskId)}/telemetry/history?limit=${limit}`, { ...opts, timeout: 20000 }),
+  getAlarms: (taskId: string, limit = 100, opts: { showLoading?: boolean } = {}) => appConfig.useMock ? mockAlarms(taskId, limit) : request<PagedResult<AlarmEvent>>(`/api/v1/tasks/${encodeURIComponent(taskId)}/alarms?limit=${limit}`, opts),
+  ackAlarm: (alarmId: number) => request<AlarmEvent>(`/api/v1/alarms/${alarmId}/ack`, { method: 'POST' }),
+  resolveAlarm: (alarmId: number, resolution: string) => request<AlarmEvent>(`/api/v1/alarms/${alarmId}/resolve`, { method: 'POST', data: { resolution } }),
   getTraceReport: (taskId: string) => appConfig.useMock ? mockReport(taskId) : request<TraceReport>(`/api/v1/tasks/${encodeURIComponent(taskId)}/trace-report`),
+  downloadTraceReportPdf: (taskId: string) => new Promise<string>((resolve, reject) => {
+    const token = uni.getStorageSync('coldchain_auth_session_v2')?.token
+    uni.downloadFile({
+      url: `${appConfig.apiBaseUrl}/api/v1/tasks/${encodeURIComponent(taskId)}/trace-report.pdf`,
+      header: token ? { authorization: `Bearer ${token}` } : {},
+      timeout: 30000,
+      success: (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 300 && res.tempFilePath) {
+          resolve(res.tempFilePath)
+          return
+        }
+        reject(new Error(`PDF 下载失败（${res.statusCode || 'unknown'}）`))
+      },
+      fail: (err) => reject(new Error(err?.errMsg || 'PDF 下载失败')),
+    })
+  }),
   startTask: (taskId: string) => appConfig.useMock ? mockStart(taskId) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/start`, { method: 'POST' }),
   arriveTask: (taskId: string) => request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/arrive`, { method: 'POST' }),
   signTask: (taskId: string) => appConfig.useMock ? mockSign(taskId) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/sign`, { method: 'POST' }),
   rejectTask: (taskId: string, reason: string) => appConfig.useMock ? mockReject(taskId, reason) : request<Task>(`/api/v1/tasks/${encodeURIComponent(taskId)}/reject`, { method: 'POST', data: { reason } }),
+  deleteTask: (taskId: string) => request<{ task_id: string }>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }),
   getDashboardSummary: () => request<DashboardSummary>('/api/v1/dashboard/summary'),
 }

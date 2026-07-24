@@ -18,6 +18,9 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+backend/data/
+uploads/
+backend/deploy/bt-deploy-out/
 
 # Logs and temporary files
 *.log

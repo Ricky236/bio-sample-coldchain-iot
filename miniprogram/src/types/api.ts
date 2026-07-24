@@ -22,6 +22,8 @@ export interface Task {
   temperature_range?: string | null; created_at?: string | null
   carrier_user_id?: string | number | null; receiver_user_id?: string | number | null
   temperature_min?: number | null; temperature_max?: number | null
+  latest_temperature?: number | null; latest_humidity?: number | null
+  latest_temp_status?: TemperatureStatus | null; abnormal_count?: number | null
 }
 export interface CreateTaskInput {
   sample_name: string; batch: string; receiver: string; carrier: string; expected_arrival: string
@@ -35,6 +37,9 @@ export interface Telemetry {
   id: number; device_id: string; task_id: string; temperature: number; humidity: number; light_raw: number
   box_status: BoxStatus; move_status: MoveStatus; temp_status: TemperatureStatus; acc_total: number
   motion_score: number; event_type: string; timestamp: string; created_at: string
+  sequence?: number | null; battery?: number | null
+  lat?: number | null; lng?: number | null; accuracy?: number | null
+  event_display?: string | null
 }
 export interface ContractMeta {
   task_statuses: TaskStatus[]; box_statuses: BoxStatus[]; move_statuses: MoveStatus[]
@@ -42,9 +47,19 @@ export interface ContractMeta {
 }
 export interface PagedResult<T> { limit?: number; page?: number; page_size?: number; total?: number; items: T[] }
 
+export type AlarmStatus = 'new' | 'acknowledged' | 'resolved'
 export interface AlarmEvent {
   id: number; data_id: number; task_id: string; device_id: string; event_type: string
   event_name: string; event_detail: string; timestamp: string; created_at: string
+  alarm_status?: AlarmStatus | string | null
+  acknowledged_at?: string | null; resolved_at?: string | null; resolution?: string | null
+  event_level?: string | null; description?: string | null
+  source?: 'local' | 'live' | string | null
+  responsible_user_id?: string | number | null
+  responsible_role?: 'owner' | 'carrier' | 'receiver' | string | null
+  responsible_label?: string | null
+  responsible_name?: string | null
+  can_handle?: boolean | null
 }
 export interface HardwareSnapshot {
   source_url: string; generated_at: string | null

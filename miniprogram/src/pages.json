@@ -4,6 +4,7 @@
     { "path": "pages/tasks/index", "style": { "navigationBarTitleText": "我的任务", "enablePullDownRefresh": true } },
     { "path": "pages/task-detail/index", "style": { "navigationBarTitleText": "任务详情", "enablePullDownRefresh": true } },
     { "path": "pages/handoff/index", "style": { "navigationBarTitleText": "发出交接" } },
+    { "path": "pages/monitor-pick/index", "style": { "navigationBarTitleText": "选择监控任务", "enablePullDownRefresh": true } },
     { "path": "pages/monitor/index", "style": { "navigationBarTitleText": "实时监控", "enablePullDownRefresh": true } },
     { "path": "pages/alarms/index", "style": { "navigationBarTitleText": "异常告警", "enablePullDownRefresh": true } },
     { "path": "pages/acceptance/index", "style": { "navigationBarTitleText": "到达验收" } },
@@ -17,5 +18,11 @@
     "navigationBarTitleText": "冷链转运",
     "navigationBarBackgroundColor": "#ffffff",
     "backgroundColor": "#fbfcf9"
-  }
+  },
+  "permission": {
+    "scope.userLocation": {
+      "desc": "用于在实时监控页展示冷链运输轨迹地图"
+    }
+  },
+  "requiredPrivateInfos": ["getLocation", "chooseLocation"]
 }

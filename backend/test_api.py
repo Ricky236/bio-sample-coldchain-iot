@@ -10,6 +10,16 @@ import tempfile
 
 os.environ["DATABASE_PATH"] = tempfile.NamedTemporaryFile(delete=False).name
 os.environ["FILE_STORAGE_DIR"] = tempfile.mkdtemp(prefix="coldchain-files-")
+# 单测沿用设备上报的 box_status，不启用光敏重判，避免 mock light_raw 与现场阈值冲突
+os.environ["LIGHT_BOX_STATUS_OVERRIDE"] = "false"
+# 单测保留 TASK-001 种子；正式库默认不种演示单
+os.environ["SEED_DEMO_TASK"] = "true"
+# 单测需要旧版无鉴权接口；生产默认关闭
+os.environ["ENABLE_LEGACY_DEMO_API"] = "true"
+os.environ["ENABLE_DEMO_DASHBOARD"] = "true"
+os.environ["ENABLE_API_DOCS"] = "false"
+os.environ["ALLOW_LOCAL_SIMULATION"] = "false"
+os.environ["ENABLE_LIVE_HARDWARE_PROXY"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -655,9 +665,9 @@ def test_v1_task_permission_assign_cancel_and_precheck():
         "/api/v1/tasks",
         headers={"Authorization": f"Bearer {carrier_token}"},
     )
-    assert [item["task_id"] for item in carrier_list.json()["data"]["items"]] == [
-        task_id
-    ]
+    carrier_ids = [item["task_id"] for item in carrier_list.json()["data"]["items"]]
+    assert task_id in carrier_ids
+    assert carrier_ids.count(task_id) == 1
 
     receiver_detail = client.get(
         f"/api/v1/tasks/{task_id}",
@@ -680,6 +690,15 @@ def test_v1_task_permission_assign_cancel_and_precheck():
     )
     assert cancel_after_precheck.status_code == 200
     assert cancel_after_precheck.json()["data"]["status"] == "canceled"
+
+    deleted = client.delete(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["task_id"] == task_id
+    missing = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+    assert missing.status_code == 404
+
+    demo_blocked = client.delete("/api/v1/tasks/TASK-001", headers=sender_headers)
+    assert demo_blocked.status_code == 403
 
 
 def test_v1_sender_can_query_assignment_candidates_with_minimal_fields():
@@ -2280,3 +2299,55 @@ def test_openapi_and_all_frontend_mocks_are_parseable_and_current():
     for mock_file in mock_files:
         body = json.loads(mock_file.read_text(encoding="utf-8"))
         assert {"code", "message", "data"}.issubset(body)
+
+
+def test_legacy_device_data_remaps_to_bound_waybill():
+    """硬件仍报 TASK-001 时，应按设备当前绑定运单落库。"""
+    token, _ = register_and_login("sender_remap_task", "sender", "高校实验室")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={"sample_name": "运单归属改写样本"},
+    )
+    assert created.status_code == 200
+    task_id = created.json()["data"]["task_id"]
+    assert task_id != "TASK-001"
+
+    assert (
+        client.post(
+            "/api/v1/devices",
+            headers=headers,
+            json={"device_id": "CLD-REMAP-001", "device_secret": "remap-secret"},
+        ).status_code
+        == 200
+    )
+    bound = client.post(
+        f"/api/v1/devices/CLD-REMAP-001/bind",
+        headers=headers,
+        json={"task_id": task_id},
+    )
+    assert bound.status_code == 200
+
+    payload = {
+        "device_id": "CLD-REMAP-001",
+        "task_id": "TASK-001",
+        "temperature": 4.2,
+        "humidity": 55.0,
+        "light_raw": 120,
+        "box_status": "BOX_CLOSED",
+        "move_status": "STABLE",
+        "temp_status": "TEMP_OK",
+        "acc_total": 9.8,
+        "motion_score": 0.1,
+    }
+    response = client.post("/api/device/data", json=payload)
+    assert response.status_code == 200
+    assert response.json()["data"]["task_id"] == task_id
+
+    report = client.get(f"/api/v1/tasks/{task_id}/trace-report", headers=headers)
+    assert report.status_code == 200
+    summary = report.json()["data"]["summary"]
+    assert summary["total_records"] >= 1
+    assert summary["avg_temperature"] == 4.2

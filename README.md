@@ -44,7 +44,9 @@
 
 后端联调入口：
 
-- [API 契约](docs/api/API_CONTRACT.md)
+- [完整后端接口文档](docs/api/BACKEND_API.md)
+- [API 契约（精简）](docs/api/API_CONTRACT.md)
+- [OpenAPI JSON](docs/api/openapi.json)
 - [前端交接说明](docs/api/FRONTEND_HANDOFF.md)
 - [前端 Mock 数据](docs/api/mock/)
 

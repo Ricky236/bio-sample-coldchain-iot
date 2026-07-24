@@ -4,14 +4,16 @@ import { onLoad, onShow } from '@dcloudio/uni-app'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import StatePanel from '@/components/StatePanel.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import RouteTrackCard from '@/components/RouteTrackCard.vue'
 import { errorMessage } from '@/services/request'
 import { taskService } from '@/services/tasks'
 import { useSessionStore } from '@/stores/session'
-import type { EvidenceFile, TraceReport } from '@/types/api'
+import type { EvidenceFile, Telemetry, TraceReport } from '@/types/api'
 
 const session = useSessionStore()
 const taskId = ref('')
 const report = ref<TraceReport | null>(null)
+const history = ref<Telemetry[]>([])
 const loading = ref(true)
 const submitting = ref(false)
 const uploading = ref(false)
@@ -51,7 +53,14 @@ const recommendation = computed(() => riskScore.value >= 90 ? '可接收' : risk
 
 async function load() {
   loading.value = true; error.value = ''
-  try { report.value = await taskService.getTraceReport(taskId.value) }
+  try {
+    const [reportData, historyData] = await Promise.all([
+      taskService.getTraceReport(taskId.value),
+      taskService.getTelemetryHistory(taskId.value, 100),
+    ])
+    report.value = reportData
+    history.value = historyData.items || []
+  }
   catch (e) { error.value = errorMessage(e) }
   finally { loading.value = false }
 }
@@ -123,6 +132,7 @@ onShow(() => { if (taskId.value && !loading.value) load() })
         <view class="section-heading"><view class="section-title">全程摘要</view><view class="section-hint">{{ report.summary.total_records }} 条记录</view></view>
         <view class="metrics"><view><b>{{ report.summary.min_temperature ?? '--' }}℃</b><text>最低温度</text></view><view><b>{{ report.summary.max_temperature ?? '--' }}℃</b><text>最高温度</text></view><view><b>{{ report.summary.avg_temperature ?? '--' }}℃</b><text>平均温度</text></view><view><b>{{ report.summary.event_count }}</b><text>异常事件</text></view></view>
       </view>
+      <RouteTrackCard title="发出 / 途中 / 接收位置与轨迹" :items="history" stage="receive" :departed="true" />
       <view class="card">
         <view class="section-title">验收检查</view>
         <view class="check"><i :class="{ issue: (report.summary.max_temperature || 0) > 8 }">{{ (report.summary.max_temperature || 0) > 8 ? '!' : '✓' }}</i><view><b>温控记录</b><text>{{ (report.summary.max_temperature || 0) > 8 ? '存在温度越限，需要复核' : '温度记录正常' }}</text></view></view>

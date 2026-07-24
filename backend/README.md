@@ -2,41 +2,31 @@
 
 这是比赛项目的 FastAPI + SQLite MVP 后端。它负责接收 UniKnect 开发板数据，并为 Web 管理端和微信小程序提供统一接口。
 
-## 第一次运行
-
-在新 clone 的仓库根目录打开终端，逐行执行：
+## 第一次运行（开发）
 
 ```bash
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-看到 `Application startup complete` 表示启动成功。浏览器可打开：
+## 生产部署（可上传服务器）
 
-- 比赛演示看板：<http://127.0.0.1:8000/>
-- Swagger 接口调试页：<http://127.0.0.1:8000/docs>
-- 接口契约检查：<http://127.0.0.1:8000/api/v1/meta/contracts>
+详见：
 
-端口不是项目固定配置。如果 8000 被占用，可以换成 8020 等空闲端口，浏览器地址也对应修改。当前联调建议统一使用 8000。
+- `deploy/DEPLOY.md` — 上传、环境变量、管理员、systemd、Nginx
+- `scripts/start-prod.sh` / `scripts/start-prod.ps1` — 无 reload 的生产启动
+- `.env.example` — 复制为 `.env` 后修改
 
-默认允许来自本机 `localhost` 和 `127.0.0.1` 任意端口的 Web 开发请求。部署到明确域名时，由负责人设置 `CORS_ORIGIN_REGEX`，例如：
-
-```bash
-CORS_ORIGIN_REGEX='^https://example\.com$' uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-公开注册不能创建管理员。首次初始化管理员请在后端目录运行：
+生产默认关闭演示看板与 `/docs`。首次管理员：
 
 ```bash
 python create_admin.py --phone admin_phone --name 管理员 --organization 组委会
 ```
 
-脚本会在终端隐藏输入密码，不会把默认账号或密码写入仓库。
-
-## 每次重新启动
+## 每次重新启动（开发）
 
 ```bash
 cd backend
@@ -45,6 +35,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 按 `Control + C` 停止服务。
+
+生产启动请用 `scripts/start-prod.*`，不要加 `--reload`。
+
+默认允许来自本机 `localhost` 和 `127.0.0.1` 任意端口的 Web 开发请求。部署到明确域名时，在 `.env` 设置 `CORS_ORIGIN_REGEX`。
 
 ## 统一数据结构与状态
 
@@ -578,7 +572,9 @@ python -m pytest test_api.py -v
 ## 数据与文档
 
 - 数据库：`backend/device_data.db`，首次启动自动创建。
-- 详细接口契约：`docs/api/API_CONTRACT.md`。
+- 完整后端接口文档：`docs/api/BACKEND_API.md`
+- 详细接口契约：`docs/api/API_CONTRACT.md`
+- OpenAPI：`docs/api/openapi.json`
 - 前端 Mock 数据：`docs/api/mock/`。
 - MVP 设计：`docs/backend/MVP_BACKEND_DESIGN.md`。
 

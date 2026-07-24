@@ -6,6 +6,7 @@ import { useSessionStore } from '@/stores/session'
 import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
 import type { Task } from '@/types/api'
+import { taskStatusText } from '@/utils/status'
 
 const session = useSessionStore()
 const tasks = ref<Task[]>([])
@@ -18,27 +19,60 @@ const filtered = computed(() => {
   const query = keyword.value.trim().toLowerCase()
   return tasks.value.filter((task) => {
     const statusOK = activeFilter.value === 'all' || task.status === activeFilter.value
-    const queryOK = !query || [task.task_id, task.sample_name, task.device_id].some((v) => v.toLowerCase().includes(query))
+    const queryOK = !query || [task.task_id, task.sample_name, task.device_id].some((v) => String(v || '').toLowerCase().includes(query))
     return statusOK && queryOK
   })
 })
 const currentTask = computed(() => tasks.value.find((task) => task.status === 'in_transit') || tasks.value[0] || null)
 const roleName = computed(() => session.user?.role === 'sender' ? '发货方' : session.user?.role === 'carrier' ? '承运方' : session.user?.role === 'receiver' ? '接收方' : '管理员')
 
-function count(status: typeof activeFilter.value) {
-  return status === 'all' ? tasks.value.length : tasks.value.filter((task) => task.status === status).length
+function tempRangeText(task: Task) {
+  if (task.temperature_range) return task.temperature_range.replace(/\s/g, '')
+  if (task.temperature_min != null && task.temperature_max != null) {
+    return `${task.temperature_min}~${task.temperature_max}℃`
+  }
+  return '未设置温控'
 }
+
+function tempReadingText(task: Task) {
+  return task.latest_temperature == null ? '--℃' : `${Number(task.latest_temperature).toFixed(1)}℃`
+}
+
+function statusShort(task: Task) {
+  return taskStatusText[task.status] || task.status
+}
+
+function riskText(task: Task) {
+  const temp = task.latest_temperature
+  if (temp == null) return '待监测'
+  if (task.latest_temp_status === 'TEMP_ALERT') return '温度异常'
+  const min = task.temperature_min
+  const max = task.temperature_max
+  if (min != null && max != null && (temp < min || temp > max)) return '超温控范围'
+  if ((task.abnormal_count || 0) > 0) return '有告警'
+  return '风险低'
+}
+
 async function load() {
-  loading.value = true; error.value = ''
-  try { tasks.value = await taskService.listTasks() }
-  catch (e) { error.value = errorMessage(e) }
-  finally { loading.value = false; uni.stopPullDownRefresh() }
+  loading.value = true
+  error.value = ''
+  try {
+    tasks.value = await taskService.listTasks()
+  } catch (e) {
+    error.value = errorMessage(e)
+  } finally {
+    loading.value = false
+    uni.stopPullDownRefresh()
+  }
 }
 function openTask(task = currentTask.value) {
   if (!task) return uni.showToast({ title: '暂无运单', icon: 'none' })
   uni.navigateTo({ url: `/pages/task-detail/index?task_id=${encodeURIComponent(task.task_id)}` })
 }
 function openPage(page: 'monitor' | 'alarms' | 'handoff' | 'acceptance' | 'trace') {
+  if (page === 'monitor') {
+    return uni.navigateTo({ url: '/pages/monitor-pick/index' })
+  }
   if (!currentTask.value) return uni.showToast({ title: '暂无可操作运单', icon: 'none' })
   uni.navigateTo({ url: `/pages/${page}/index?task_id=${encodeURIComponent(currentTask.value.task_id)}` })
 }
@@ -81,11 +115,11 @@ onPullDownRefresh(load)
     <StatePanel v-if="loading" state="loading" />
     <StatePanel v-else-if="error" state="error" :message="error" @retry="load" />
     <view v-else-if="currentTask" class="waybill-card" @tap="openTask()">
-      <view class="chips"><text>运单号</text><view><text>2~8℃</text><text>{{ currentTask.device_id }}</text></view></view>
-      <view class="waybill-no">{{ currentTask.task_id === 'TASK-001' ? 'WD-20260722-001' : currentTask.task_id }}</view>
+      <view class="chips"><text>运单号</text><view><text>{{ tempRangeText(currentTask) }}</text><text>{{ currentTask.device_id || '未绑定设备' }}</text></view></view>
+      <view class="waybill-no">{{ currentTask.task_id }}</view>
       <view class="sample"><text class="sample-label">样本</text>{{ currentTask.sample_name }}</view>
-      <view class="transport">★　{{ currentTask.status === 'in_transit' ? '运输中' : '待交接' }} · 4.2℃</view>
-      <view class="coldbox"><view class="lid" /><view class="box">❄</view><view class="meter">4.2℃</view></view>
+      <view class="transport">★　{{ statusShort(currentTask) }} · {{ tempReadingText(currentTask) }}</view>
+      <view class="coldbox"><view class="lid" /><view class="box">❄</view><view class="meter">{{ tempReadingText(currentTask) }}</view></view>
       <view class="steps"><view class="done">✓<text>建档</text></view><view class="done">✓<text>预检</text></view><view class="done">✓<text>交接</text></view><view class="active">▣<text>在途</text></view><view>□<text>验收</text></view></view>
     </view>
     <view v-else class="empty-home">
@@ -105,7 +139,16 @@ onPullDownRefresh(load)
     <view class="section-head list-title"><text>进行中的任务</text><text class="more">查看全部 ›</text></view>
     <view class="filters"><text :class="{ active: activeFilter === 'all' }" @tap="activeFilter = 'all'">全部</text><text :class="{ active: activeFilter === 'pending_handoff' }" @tap="activeFilter = 'pending_handoff'">待装箱</text><text :class="{ active: activeFilter === 'in_transit' }" @tap="activeFilter = 'in_transit'">运输中</text><text :class="{ active: activeFilter === 'signed' }" @tap="activeFilter = 'signed'">待验收</text></view>
     <view class="task-grid">
-      <view v-for="task in filtered" :key="task.task_id" class="mini-task" @tap="openTask(task)"><view class="mini-icon">{{ task.status === 'signed' ? '✓' : '▣' }}</view><view class="mini-copy"><b>{{ task.task_id === 'TASK-001' ? 'WD-20260722-001' : task.task_id }}</b><text>{{ task.sample_name }}</text><small>♨ 4.2℃ · {{ task.status === 'in_transit' ? '运输中' : '待装箱' }}</small><em>♢ 风险低</em></view><view class="arrow">›</view></view>
+      <view v-for="task in filtered" :key="task.task_id" class="mini-task" @tap="openTask(task)">
+        <view class="mini-icon">{{ task.status === 'signed' ? '✓' : '▣' }}</view>
+        <view class="mini-copy">
+          <b>{{ task.task_id }}</b>
+          <text>{{ task.sample_name }}</text>
+          <small>♨ {{ tempReadingText(task) }} · {{ tempRangeText(task) }} · {{ statusShort(task) }}</small>
+          <em>♢ {{ riskText(task) }}</em>
+        </view>
+        <view class="arrow">›</view>
+      </view>
     </view>
 
     <view class="safe-space" />

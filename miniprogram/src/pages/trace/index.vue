@@ -37,9 +37,47 @@ async function load() {
   finally { loading.value = false; uni.stopPullDownRefresh() }
 }
 function openAcceptance() { uni.navigateTo({ url: `/pages/acceptance/index?task_id=${encodeURIComponent(taskId.value)}` }) }
-function reportAction(type: 'preview' | 'pdf' | 'share') {
-  const titles = { preview: '报告预览已生成', pdf: '正式PDF需后端文件接口', share: '已生成脱敏分享信息' }
-  uni.showToast({ title: titles[type], icon: type === 'pdf' ? 'none' : 'success' })
+
+async function openTracePdf(showMenu = false) {
+  uni.showLoading({ title: '生成 PDF', mask: true })
+  try {
+    const filePath = await taskService.downloadTraceReportPdf(taskId.value)
+    await new Promise<void>((resolve, reject) => {
+      uni.openDocument({
+        filePath,
+        fileType: 'pdf',
+        showMenu,
+        success: () => resolve(),
+        fail: (err) => reject(new Error(err?.errMsg || '无法打开 PDF')),
+      })
+    })
+  } catch (e) {
+    uni.showToast({ title: errorMessage(e), icon: 'none' })
+  } finally {
+    uni.hideLoading()
+  }
+}
+
+async function reportAction(type: 'preview' | 'pdf' | 'share') {
+  if (!report.value) return
+  if (type === 'preview' || type === 'pdf') {
+    await openTracePdf(type === 'pdf')
+    return
+  }
+  const task = report.value.task
+  const summary = report.value.summary
+  const text = [
+    `冷链追溯摘要 ${task.task_id}`,
+    `样本：${task.sample_name}`,
+    `状态：${task.status}`,
+    `设备：${task.device_id || '—'}`,
+    `监测 ${summary.total_records} 条 · 异常 ${summary.event_count} 条`,
+    `均温 ${summary.avg_temperature ?? '--'}℃`,
+  ].join('\n')
+  uni.setClipboardData({
+    data: text,
+    success: () => uni.showToast({ title: '脱敏摘要已复制', icon: 'success' }),
+  })
 }
 onLoad((query) => {
   taskId.value = String(query?.task_id || '')
@@ -86,7 +124,7 @@ onShow(() => { if (taskId.value && !loading.value) load() })
           <view><view class="evidence-value">{{ report.summary.event_count }}</view><view class="evidence-label">异常事件</view></view>
           <view><view class="evidence-value">{{ report.summary.avg_temperature ?? '--' }}℃</view><view class="evidence-label">平均温度</view></view>
         </view>
-        <view class="evidence-note">当前报告来自统一追溯接口。哈希链校验和 PDF 导出尚需后端增加正式字段与文件接口。</view>
+        <view class="evidence-note">报告数据来自统一追溯接口；可预览或导出服务端生成的 PDF，也可复制脱敏摘要分享。</view>
         <view class="report-actions"><button @tap="reportAction('preview')">◉ 预览报告</button><button @tap="reportAction('pdf')">▤ 导出 PDF</button><button @tap="reportAction('share')">⌯ 分享脱敏</button></view>
       </view>
 

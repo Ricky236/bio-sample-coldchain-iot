@@ -13,6 +13,12 @@
       "minified": true,
       "ignoreDevUnusedFiles": false,
       "compileHotReLoad": false
-    }
+    },
+    "permission": {
+      "scope.userLocation": {
+        "desc": "用于在实时监控页展示冷链运输轨迹地图"
+      }
+    },
+    "requiredPrivateInfos": ["getLocation", "chooseLocation"]
   }
 }

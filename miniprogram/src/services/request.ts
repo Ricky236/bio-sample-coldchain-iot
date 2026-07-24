@@ -7,7 +7,12 @@ export class ApiError extends Error {
 
 const AUTH_SESSION_KEY = 'coldchain_auth_session_v2'
 
-interface RequestOptions { method?: UniApp.RequestOptions['method'] | 'PATCH'; data?: UniApp.RequestOptions['data']; showLoading?: boolean }
+interface RequestOptions {
+  method?: UniApp.RequestOptions['method'] | 'PATCH'
+  data?: UniApp.RequestOptions['data']
+  showLoading?: boolean
+  timeout?: number
+}
 
 function validationMessage(detail: unknown) {
   if (!Array.isArray(detail)) return ''
@@ -28,7 +33,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   try {
     const response = await uni.request({
       url: `${appConfig.apiBaseUrl}${path}`,
-      method: (options.method || 'GET') as UniApp.RequestOptions['method'], data: options.data, timeout: 10000,
+      method: (options.method || 'GET') as UniApp.RequestOptions['method'], data: options.data, timeout: options.timeout ?? 10000,
       header: {
         'content-type': 'application/json',
         ...(uni.getStorageSync(AUTH_SESSION_KEY)?.token ? { authorization: `Bearer ${uni.getStorageSync(AUTH_SESSION_KEY).token}` } : {}),
