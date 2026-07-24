@@ -28,6 +28,14 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 CORS_ORIGIN_REGEX='^https://example\.com$' uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+公开注册不能创建管理员。首次初始化管理员请在后端目录运行：
+
+```bash
+python create_admin.py --phone admin_phone --name 管理员 --organization 组委会
+```
+
+脚本会在终端隐藏输入密码，不会把默认账号或密码写入仓库。
+
 ## 每次重新启动
 
 ```bash
@@ -125,19 +133,20 @@ Web 管理端和微信小程序统一使用 `/api/v1`。当前后端 MVP 已支�
 
 ### 账号接口
 
-- `POST /api/v1/auth/register`：注册用户，支持 `name、phone、organization、role、password`。
+- `POST /api/v1/auth/register`：注册用户，支持 `name、phone、organization、role、password`；公开注册只允许 `sender/carrier/receiver`，默认禁止注册 `admin`。
 - `POST /api/v1/auth/login`：登录，返回 Bearer Token。
 - `GET /api/v1/auth/me`：获取当前用户。
 - `GET /api/v1/auth/permissions`：获取当前角色权限。
 - `POST /api/v1/auth/refresh`：刷新 Token，旧 Token 会失效。
 - `POST /api/v1/auth/logout`：退出登录。
+- `GET /api/v1/users?role=carrier|receiver`：发货方或管理员查询可指派人员的最小信息目录。
 
 ### 运单接口
 
 - `GET /api/v1/tasks`：按当前登录用户权限查询运单列表。
 - `POST /api/v1/tasks`：创建正式运单，后端自动生成 `WD-YYYYMMDD-001` 格式运单号。
 - `GET /api/v1/tasks/{task_id}`：任务详情。
-- `PUT /api/v1/tasks/{task_id}`（小程序使用）或 `PATCH /api/v1/tasks/{task_id}`：修改未发出的运单。仅任务发货方/管理员可操作，仅允许 `pending_pack`、`pending_handoff` 状态；修改承运人或接收人时会同步关联其注册账号，并写入审计日志。
+- `PATCH /api/v1/tasks/{task_id}`：编辑未发出的运单。
 - `POST /api/v1/tasks/{task_id}/assign`：指派承运方和接收方。
 - `POST /api/v1/tasks/{task_id}/precheck`：保存装箱预检，通过后进入 `pending_handoff`。
 - `POST /api/v1/tasks/{task_id}/cancel`：取消未发出的运单。
@@ -169,6 +178,7 @@ Web 管理端和微信小程序统一使用 `/api/v1`。当前后端 MVP 已支�
 - `GET /api/v1/devices`：设备列表，包含在线状态、电量、最后在线时间和当前绑定任务。
 - `POST /api/v1/devices/{device_id}/bind`：绑定设备到运单。
 - `POST /api/v1/devices/{device_id}/unbind`：解绑设备。
+- `POST /api/v1/devices/{device_id}/rotate-secret`：轮换设备密钥，新密钥只返回一次。
 - `GET /api/v1/devices/{device_id}/bindings`：设备绑定历史。
 
 ### 告警和交接接口
@@ -176,6 +186,7 @@ Web 管理端和微信小程序统一使用 `/api/v1`。当前后端 MVP 已支�
 - `POST /api/v1/alarms/{alarm_id}/ack`：确认告警。
 - `POST /api/v1/alarms/{alarm_id}/resolve`：填写处置结果并关闭告警。
 - `POST /api/v1/tasks/{task_id}/handoffs`：发起交接会话。
+- `GET /api/v1/tasks/{task_id}/handoffs`：分页查询任务交接记录和证据状态。
 - `GET /api/v1/handoffs/{handoff_id}`：查询交接会话。
 - `POST /api/v1/handoffs/{handoff_id}/confirm`：确认责任转移。
 - `POST /api/v1/handoffs/{handoff_id}/reject`：拒绝交接。
@@ -187,7 +198,9 @@ Web 管理端和微信小程序统一使用 `/api/v1`。当前后端 MVP 已支�
 - `DELETE /api/v1/face/profile`：注销本人人脸资料。
 - `POST /api/v1/face/verify`：交接时提交活体/相似度核验结果。
 - `POST /api/v1/files`：登记证据文件元数据。
+- `POST /api/v1/files/upload`：上传 JPEG、PNG 或 PDF 证据文件，最大 5 MB。
 - `GET /api/v1/files/{file_id}`：获取证据文件下载信息。
+- `GET /api/v1/files/{file_id}/download`：经过任务权限校验后下载文件。
 - `GET /api/v1/tasks/{task_id}/trace-report.pdf`：导出简版 PDF 追溯报告。
 
 ### 管理与审计接口
@@ -201,10 +214,11 @@ Web 管理端和微信小程序统一使用 `/api/v1`。当前后端 MVP 已支�
 - `POST /api/v1/admin/face-reviews/{review_id}/reject`：拒绝人工复核。
 - `GET /api/v1/notifications`：当前用户消息列表。
 - `POST /api/v1/notifications/{notification_id}/read`：标记消息已读。
+- `GET /api/v1/dashboard/summary`：管理员查看任务、设备和告警聚合指标。
 
 旧版 `/api/device/*`、`/api/task/*` 和首页看板均继续保留。
 
-当前 MVP 已实现二维码 Token 生成、验证、一次性消费和撤销，也支持人脸核验占位流程、登记证据文件元数据、消息通知和简版 PDF 追溯报告；暂不接入真实人脸供应商、复杂 PDF 排版和真实二进制文件存储。交接会话已先具备后端记录和责任转移能力，后续可以继续把人脸核验结果强制接入交接确认。
+当前 MVP 已实现二维码 Token 生成、验证、一次性消费和撤销，交接确认强制要求指定接收方已经验证二维码；也支持人脸核验占位流程、真实证据文件上传与受控下载、消息通知和简版 PDF 追溯报告。暂不接入真实人脸供应商和复杂 PDF 排版，人脸结果仅作为模拟/人工复核证据。
 
 ### 历史数据查询参数
 
@@ -576,25 +590,6 @@ python -m pytest test_api.py -v
 
 任务不存在返回 HTTP 404；状态不允许操作返回 HTTP 409。前端应判断 HTTP 状态码和 `code`，不要通过中文提示文字判断业务状态。
 
-## 真实硬件实时快照
-
-后端通过下列接口代理硬件快照，供小程序按当前运单安全读取：
-
-```http
-GET /api/v1/tasks/{task_id}/hardware/snapshot
-Authorization: Bearer <token>
-```
-
-默认上游地址为 `http://47.103.152.175:8080/api/v1/admin/live-snapshot`。可配置：
-
-```text
-LIVE_SNAPSHOT_URL=http://47.103.152.175:8080/api/v1/admin/live-snapshot
-LIVE_SNAPSHOT_TIMEOUT=6
-LIVE_SNAPSHOT_CACHE_SECONDS=3
-```
-
-代理接口会先校验用户的运单访问权限，再按 `task_id`、`device_id` 依次严格匹配。没有匹配时返回 `matched: false`，不会拿其他设备的数据代替当前设备。
-
 ## 安全与追溯增强
 
 当前后端已完成以下安全加固：
@@ -603,7 +598,10 @@ LIVE_SNAPSHOT_CACHE_SECONDS=3
 - 旧版 SHA-256 密码哈希账号仍可登录，登录成功后会自动升级为 PBKDF2。
 - 登录 Token 只保存 SHA-256 哈希，不在数据库中保存明文 Token。
 - 用户被管理员停用后，已有 Token 会被撤销。
-- 设备登记 `device_secret` 后，正式遥测和心跳接口会校验 HMAC-SHA256 签名。
+- 普通请求不能公开注册管理员；仅本地受控初始化可临时设置 `ALLOW_ADMIN_SELF_REGISTER=true`。
+- 正式遥测和心跳只接受已登记、已配置密钥并已绑定任务的设备。
+- 所有设备响应使用字段白名单，不返回 `device_secret`、`device_secret_hash` 或其他签名材料。
+- 设备只能由其登记人或管理员管理，其他发货方不能覆盖、查询绑定历史或解绑。
 - 已签名设备会记录 `X-Nonce`，重复 nonce 会被拒绝，防止重放。
 
 当前后端已增加状态历史：
@@ -616,8 +614,13 @@ LIVE_SNAPSHOT_CACHE_SECONDS=3
 
 当前为了兼容正在运行的开发板，旧接口 `POST /api/device/data` 不强制设备签名。正式接口中：
 
-- 未登记 `device_secret` 的设备：继续兼容免签名上传。
-- 已登记 `device_secret` 的设备：`POST /api/v1/device/telemetry` 和 `POST /api/v1/device/heartbeat` 必须带签名。
+- 未登记设备：HTTP 401，业务码 `40125`。
+- 已登记但未配置密钥的设备：HTTP 401，业务码 `40126`。
+- 缺少或错误签名：HTTP 401。
+- 重复 nonce：HTTP 409，业务码 `40940`。
+- 设备没有绑定到请求中的任务：HTTP 409，业务码 `40920`。
+
+设备必须通过 `POST /api/v1/devices/{device_id}/bind` 绑定任务。创建或编辑任务时提交裸 `device_id` 会返回 HTTP 422、业务码 `42206`，避免设备表、绑定历史和任务三处关系不一致。解绑会同时把设备恢复为 `available` 并清空任务的 `device_id`。
 
 请求头：
 

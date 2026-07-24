@@ -4,19 +4,40 @@ import { onLoad, onShow } from '@dcloudio/uni-app'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import StatePanel from '@/components/StatePanel.vue'
 import StatusTag from '@/components/StatusTag.vue'
-import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
-import type { TraceReport } from '@/types/api'
+import { taskService } from '@/services/tasks'
+import { useSessionStore } from '@/stores/session'
+import type { EvidenceFile, TraceReport } from '@/types/api'
 
+const session = useSessionStore()
 const taskId = ref('')
 const report = ref<TraceReport | null>(null)
 const loading = ref(true)
 const submitting = ref(false)
+const uploading = ref(false)
 const error = ref('')
 const reason = ref('')
 const action = ref<'sign' | 'reject' | null>(null)
+const evidenceFiles = ref<EvidenceFile[]>([])
 
-const allowed = computed(() => report.value ? ['in_transit', 'arrived'].includes(report.value.task.status) : false)
+const isAssignedReceiver = computed(() => Boolean(
+  report.value
+  && (
+    session.user?.role === 'admin'
+    || (
+      session.user?.role === 'receiver'
+      && String(report.value.task.receiver_user_id || '') === String(session.user?.id || '')
+    )
+  ),
+))
+const allowed = computed(() => Boolean(report.value?.task.status === 'arrived' && isAssignedReceiver.value))
+const permissionHint = computed(() => {
+  if (!report.value) return ''
+  if (!report.value.task.receiver_user_id) return '该运单未绑定接收方账号，请发货方先补充接收人'
+  if (!isAssignedReceiver.value) return '当前账号不是该运单指定的接收方，只能查看验收报告'
+  if (report.value.task.status === 'in_transit') return '请先由承运人发起到达交接，接收方扫码并完成人脸核验'
+  return ''
+})
 const alertTypes = computed(() => new Set(report.value?.events.map((item) => item.event_type) || []))
 const riskScore = computed(() => {
   let score = 100
@@ -27,7 +48,6 @@ const riskScore = computed(() => {
   return Math.max(score, 0)
 })
 const recommendation = computed(() => riskScore.value >= 90 ? '可接收' : riskScore.value >= 70 ? '需要复核' : '建议隔离')
-const riskTone = computed(() => riskScore.value >= 90 ? 'safe' : riskScore.value >= 70 ? 'review' : 'danger')
 
 async function load() {
   loading.value = true; error.value = ''
@@ -36,17 +56,38 @@ async function load() {
   finally { loading.value = false }
 }
 function choose(next: 'sign' | 'reject') {
-  if (!allowed.value) { uni.showToast({ title: '当前任务状态不可验收', icon: 'none' }); return }
-  if (next === 'reject' && !reason.value.trim()) { uni.showToast({ title: '请先填写拒收原因', icon: 'none' }); return }
+  if (!allowed.value) return uni.showToast({ title: '当前任务状态不可验收', icon: 'none' })
+  if (next === 'reject' && !reason.value.trim()) return uni.showToast({ title: '请填写拒收原因', icon: 'none' })
   action.value = next
 }
-function markDecision(type: 'review' | 'isolate') { uni.showToast({ title: type === 'review' ? '已转质量复核' : '已标记隔离处理', icon: 'success' }) }
-function evidence(type: 'photo' | 'sign' | 'note') {
-  if (type === 'photo') return uni.chooseImage({ count: 3 })
-  uni.showToast({ title: type === 'sign' ? '签名板待真机调用' : '请在说明框填写备注', icon: 'none' })
+async function chooseEvidence() {
+  if (!allowed.value) return uni.showToast({ title: permissionHint.value || '当前不可上传验收证据', icon: 'none' })
+  if (uploading.value) return
+  try {
+    const paths = await new Promise<string[]>((resolve, reject) => {
+      uni.chooseImage({
+        count: 3, sizeType: ['compressed'], sourceType: ['camera', 'album'],
+        success: ({ tempFilePaths }) => resolve((Array.isArray(tempFilePaths) ? tempFilePaths : [tempFilePaths]).map(String)),
+        fail: reject,
+      })
+    })
+    uploading.value = true
+    for (const path of paths) {
+      const file = await taskService.uploadEvidence(path, taskId.value, 'acceptance_photo', 'task', taskId.value)
+      evidenceFiles.value.push(file)
+    }
+    uni.showToast({ title: `已上传 ${paths.length} 份证据`, icon: 'success' })
+  } catch (e) {
+    const message = errorMessage(e)
+    if (!/cancel/i.test(message)) uni.showToast({ title: message, icon: 'none', duration: 3000 })
+  } finally { uploading.value = false }
 }
 async function submit() {
   if (!action.value || submitting.value) return
+  if (!allowed.value) {
+    action.value = null
+    return uni.showToast({ title: permissionHint.value || '当前账号无验收权限', icon: 'none', duration: 3000 })
+  }
   submitting.value = true
   try {
     if (action.value === 'sign') await taskService.signTask(taskId.value)
@@ -54,11 +95,13 @@ async function submit() {
     action.value = null
     await load()
     uni.showToast({ title: '验收结果已保存', icon: 'success' })
-  } catch (e) { action.value = null; uni.showToast({ title: errorMessage(e), icon: 'none', duration: 2600 }) }
-  finally { submitting.value = false }
+  } catch (e) {
+    action.value = null
+    uni.showToast({ title: errorMessage(e), icon: 'none', duration: 3000 })
+  } finally { submitting.value = false }
 }
-
 onLoad((query) => {
+  if (!session.requireSession()) return
   taskId.value = String(query?.task_id || '')
   if (taskId.value) load(); else { loading.value = false; error.value = '缺少 task_id' }
 })
@@ -70,52 +113,40 @@ onShow(() => { if (taskId.value && !loading.value) load() })
     <StatePanel v-if="loading" state="loading" />
     <StatePanel v-else-if="error" state="error" :message="error" @retry="load" />
     <template v-else-if="report">
-      <view class="accept-hero">
-        <view class="row"><view><view class="hero-label">ARRIVAL INSPECTION</view><view class="hero-title">到达验收</view></view><StatusTag :status="report.task.status" /></view>
-        <view class="hero-task">{{ report.task.sample_name }} · {{ report.task.task_id }}</view>
+      <view class="hero">
+        <view><text>ARRIVAL INSPECTION</text><b>到达验收</b><small>{{ report.task.sample_name }} · {{ report.task.task_id }}</small></view>
+        <StatusTag :status="report.task.status" />
       </view>
-
-      <view class="risk-card" :class="riskTone">
-        <view class="score-ring"><view class="score">{{ riskScore }}</view><view class="score-unit">风险分</view></view>
-        <view class="risk-content"><view class="risk-label">系统验收建议</view><view class="risk-result">{{ recommendation }}</view><view class="risk-note">依据现有温度、开箱和碰撞事件计算，仅作为质量复核参考</view></view>
-      </view>
-
-      <view class="card summary-card">
+      <view class="risk"><view class="score">{{ riskScore }}<small>风险分</small></view><view><label>系统验收建议</label><b>{{ recommendation }}</b><p>依据温度、开箱和碰撞事件自动计算，仅作为质量复核参考</p></view></view>
+      <view v-if="permissionHint" class="permission-hint">! {{ permissionHint }}</view>
+      <view class="card">
         <view class="section-heading"><view class="section-title">全程摘要</view><view class="section-hint">{{ report.summary.total_records }} 条记录</view></view>
-        <view class="summary-grid">
-          <view class="summary-item"><view class="summary-value">{{ report.summary.min_temperature ?? '--' }}℃</view><view class="summary-label">最低温度</view></view>
-          <view class="summary-item"><view class="summary-value" :class="{ warning: (report.summary.max_temperature || 0) > 8 }">{{ report.summary.max_temperature ?? '--' }}℃</view><view class="summary-label">最高温度</view></view>
-          <view class="summary-item"><view class="summary-value">{{ report.summary.avg_temperature ?? '--' }}℃</view><view class="summary-label">平均温度</view></view>
-          <view class="summary-item"><view class="summary-value">{{ report.summary.event_count }}</view><view class="summary-label">异常事件</view></view>
-        </view>
+        <view class="metrics"><view><b>{{ report.summary.min_temperature ?? '--' }}℃</b><text>最低温度</text></view><view><b>{{ report.summary.max_temperature ?? '--' }}℃</b><text>最高温度</text></view><view><b>{{ report.summary.avg_temperature ?? '--' }}℃</b><text>平均温度</text></view><view><b>{{ report.summary.event_count }}</b><text>异常事件</text></view></view>
       </view>
-
-      <view class="card checklist-card">
-        <view class="section-heading"><view class="section-title">验收检查</view><view class="section-hint">自动汇总</view></view>
-        <view class="check-row"><view class="check-dot" :class="{ issue: (report.summary.max_temperature || 0) > 8 }">{{ (report.summary.max_temperature || 0) > 8 ? '!' : '✓' }}</view><view><view class="check-title">温控记录</view><view class="check-desc">{{ (report.summary.max_temperature || 0) > 8 ? '存在温度越限，需要人工复核' : '全程温度未超过上限' }}</view></view></view>
-        <view class="check-row"><view class="check-dot" :class="{ issue: alertTypes.has('BOX_OPEN') }">{{ alertTypes.has('BOX_OPEN') ? '!' : '✓' }}</view><view><view class="check-title">箱体与封签</view><view class="check-desc">{{ alertTypes.has('BOX_OPEN') ? '记录到运输中开箱事件' : '未记录异常开箱' }}</view></view></view>
-        <view class="check-row"><view class="check-dot" :class="{ issue: alertTypes.has('IMPACT') }">{{ alertTypes.has('IMPACT') ? '!' : '✓' }}</view><view><view class="check-title">运输冲击</view><view class="check-desc">{{ alertTypes.has('IMPACT') ? '存在明显碰撞，请检查样本盒' : '未检测到严重冲击' }}</view></view></view>
+      <view class="card">
+        <view class="section-title">验收检查</view>
+        <view class="check"><i :class="{ issue: (report.summary.max_temperature || 0) > 8 }">{{ (report.summary.max_temperature || 0) > 8 ? '!' : '✓' }}</i><view><b>温控记录</b><text>{{ (report.summary.max_temperature || 0) > 8 ? '存在温度越限，需要复核' : '温度记录正常' }}</text></view></view>
+        <view class="check"><i :class="{ issue: alertTypes.has('BOX_OPEN') }">{{ alertTypes.has('BOX_OPEN') ? '!' : '✓' }}</i><view><b>箱体与封签</b><text>{{ alertTypes.has('BOX_OPEN') ? '记录到运输中开箱事件' : '未记录异常开箱' }}</text></view></view>
+        <view class="check"><i :class="{ issue: alertTypes.has('IMPACT') }">{{ alertTypes.has('IMPACT') ? '!' : '✓' }}</i><view><b>运输冲击</b><text>{{ alertTypes.has('IMPACT') ? '存在明显碰撞' : '未检测到严重冲击' }}</text></view></view>
       </view>
-
-      <view class="card reason-card">
+      <view class="card">
+        <view class="section-heading"><view class="section-title">验收证据</view><view class="section-hint">JPEG/PNG，单文件不超过 5MB</view></view>
+        <button class="upload" :disabled="uploading || !allowed" @tap="chooseEvidence">▣ {{ uploading ? '正在上传…' : '拍照或从相册选择' }}</button>
+        <view v-if="evidenceFiles.length" class="files"><view v-for="file in evidenceFiles" :key="file.file_id"><text>✓ {{ file.file_name }}</text><small>{{ file.file_id }}</small></view></view>
+      </view>
+      <view class="card">
         <view class="section-heading"><view class="section-title">拒收/复核说明</view><view class="section-hint">拒收时必填</view></view>
-        <textarea v-model="reason" maxlength="200" class="reason-input" placeholder="例如：温度越限且封签异常，需要质量部门复核" />
+        <textarea v-model="reason" maxlength="200" placeholder="填写异常情况、复核意见或拒收原因" />
         <view class="count">{{ reason.length }}/200</view>
       </view>
-
-      <view v-if="allowed" class="decision-grid"><button class="accept" @tap="choose('sign')">✓　确认接收<text>货品符合要求</text></button><button class="review" @tap="markDecision('review')">♙　待质量复核<text>需质量人员复核</text></button><button class="isolate" @tap="markDecision('isolate')">♢　隔离处理<text>隔离并进一步处理</text></button><button class="reject" @tap="choose('reject')">×　拒绝接收<text>不符合接收要求</text></button></view>
-      <view v-else class="result-strip">当前任务已完成验收，结果为：{{ report.task.status === 'signed' ? '已签收' : report.task.status === 'rejected' ? '已拒收' : '不可操作' }}</view>
-      <view class="card evidence-actions"><view class="section-title">验收证据</view><view><button @tap="evidence('photo')">▣<text>拍照</text></button><button @tap="evidence('sign')">✎<text>签名</text></button><button @tap="evidence('note')">▤<text>备注</text></button></view></view>
-
-      <ConfirmDialog :visible="Boolean(action)" :title="action === 'sign' ? '确认接收货物？' : '确认拒绝接收？'" :content="action === 'sign' ? '提交后任务将完成签收，并记录当前时间。' : `拒收原因：${reason}`" :confirm-text="action === 'sign' ? '确认接收' : '确认拒收'" :loading="submitting" @cancel="action = null" @confirm="submit" />
+      <view v-if="allowed" class="decisions"><button class="accept" @tap="choose('sign')">✓ 确认接收</button><button class="reject" @tap="choose('reject')">× 拒绝接收</button></view>
+      <view v-else class="result">验收流程已结束：{{ report.task.status === 'signed' ? '已签收' : report.task.status === 'rejected' ? '已拒收' : report.task.status }}</view>
+      <ConfirmDialog :visible="Boolean(action)" :title="action === 'sign' ? '确认接收货物？' : '确认拒绝接收？'" :content="action === 'sign' ? `已上传 ${evidenceFiles.length} 份本次验收证据。` : `拒收原因：${reason}`" :confirm-text="action === 'sign' ? '确认接收' : '确认拒收'" :loading="submitting" @cancel="action = null" @confirm="submit" />
     </template>
   </view>
 </template>
 
 <style scoped>
-.acceptance-page { background:linear-gradient(180deg,#eef4ff 0,#f5f7fb 430rpx); }.accept-hero { padding:30rpx 6rpx 28rpx; }.hero-label { color:#8a7fff; font-size:18rpx; font-weight:760; letter-spacing:4rpx; }.hero-title { margin-top:8rpx; color:#173149; font-size:42rpx; font-weight:820; }.hero-task { margin-top:13rpx; color:#7d8da2; font-size:23rpx; }
-.risk-card { display:grid; grid-template-columns:135rpx 1fr; align-items:center; gap:25rpx; margin-bottom:22rpx; padding:28rpx; border-radius:29rpx; color:#fff; background:linear-gradient(135deg,#f0a84b,#dd7c39); box-shadow:0 14rpx 30rpx rgba(201,123,49,.2); }.risk-card.safe { background:linear-gradient(135deg,#62b894,#3c9678); }.risk-card.danger { background:linear-gradient(135deg,#eb6b75,#c94250); }.score-ring { display:flex; flex-direction:column; align-items:center; justify-content:center; width:120rpx; height:120rpx; border:6rpx solid rgba(255,255,255,.5); border-radius:50%; background:rgba(255,255,255,.12); }.score { font-size:42rpx; font-weight:840; }.score-unit { font-size:18rpx; opacity:.8; }.risk-label { font-size:20rpx; opacity:.78; }.risk-result { margin:5rpx 0; font-size:36rpx; font-weight:800; }.risk-note { font-size:19rpx; line-height:1.45; opacity:.75; }
-.summary-grid { display:grid; grid-template-columns:1fr 1fr; gap:14rpx; }.summary-item { padding:20rpx; border-radius:18rpx; background:#f5f7fb; }.summary-value { color:#344d65; font-size:31rpx; font-weight:740; }.summary-value.warning { color:#d94c58; }.summary-label { margin-top:6rpx; color:#96a4b5; font-size:20rpx; }.check-row { display:flex; align-items:center; gap:18rpx; padding:20rpx 0; border-top:1rpx solid #edf1f5; }.check-dot { display:flex; align-items:center; justify-content:center; width:48rpx; height:48rpx; flex:0 0 auto; border-radius:16rpx; color:#fff; background:#52ae89; font-size:23rpx; font-weight:800; }.check-dot.issue { background:#e06972; }.check-title { color:#41586f; font-size:25rpx; font-weight:680; }.check-desc { margin-top:4rpx; color:#96a4b5; font-size:20rpx; }.reason-input { width:100%; height:160rpx; padding:20rpx; box-sizing:border-box; border:1rpx solid #e5eaf0; border-radius:18rpx; color:#425971; background:#f6f8fb; line-height:1.55; }.count { margin-top:9rpx; color:#9da9b8; font-size:19rpx; text-align:right; }
-.button-row { display:grid; grid-template-columns:1fr 1.4fr; gap:16rpx; margin-top:25rpx; }.reject-button,.sign-button { height:88rpx; border:0; border-radius:19rpx; font-size:28rpx; font-weight:700; line-height:88rpx; }.reject-button { color:#d24a56; background:#ffeaec; }.result-strip { padding:22rpx; border-radius:19rpx; color:#5c7086; background:#eaf0f6; text-align:center; font-size:23rpx; }
-.acceptance-page{background:#fbfcf9}.hero-label{color:#55ae06}.risk-card{color:#274019;border:1rpx solid #cde9a6;background:linear-gradient(135deg,#efffda,#d7ffa3);box-shadow:0 14rpx 30rpx rgba(77,159,13,.13)}.risk-card.safe{background:linear-gradient(135deg,#efffda,#d7ffa3)}.risk-card.danger{color:#6d3e00;background:linear-gradient(135deg,#fff8dd,#ffe9aa)}.score-ring{border-color:#82d71a;background:#fff}.decision-grid{display:grid;grid-template-columns:1fr 1fr;gap:17rpx;margin:22rpx 0}.decision-grid button{height:100rpx;border-radius:17rpx;font-size:25rpx;font-weight:750;line-height:1.25}.decision-grid button text{display:block;margin-top:7rpx;font-size:17rpx;font-weight:400}.accept{color:#fff;background:linear-gradient(135deg,#8bdf1d,#4eae00)}.review{color:#9a7100;background:linear-gradient(135deg,#fff7cf,#ffd85c)}.isolate{color:#fff;background:linear-gradient(135deg,#ffb34c,#f18a19)}.reject{border:2rpx solid #ef4549;color:#db3338;background:#fff}.evidence-actions>view:last-child{display:grid;grid-template-columns:repeat(3,1fr);gap:15rpx;margin-top:20rpx}.evidence-actions button{height:80rpx;border:1rpx solid #dfe6da;border-radius:15rpx;color:#51aa03;background:#fff;font-size:28rpx;line-height:1.1}.evidence-actions button text{display:block;margin-top:7rpx;color:#394333;font-size:18rpx}
+.acceptance-page{background:#fbfcf9}.hero{display:flex;align-items:flex-start;justify-content:space-between;padding:25rpx 5rpx}.hero text,.hero b,.hero small{display:block}.hero text{color:#55ae06;font-size:18rpx;font-weight:760;letter-spacing:3rpx}.hero b{margin:7rpx 0;color:#173149;font-size:40rpx}.hero small{color:#7d8da2;font-size:22rpx}.risk{display:grid;grid-template-columns:125rpx 1fr;align-items:center;gap:24rpx;margin-bottom:22rpx;padding:27rpx;border:1rpx solid #cde9a6;border-radius:27rpx;color:#274019;background:linear-gradient(135deg,#efffda,#d7ffa3)}.score{display:flex;flex-direction:column;align-items:center;justify-content:center;width:112rpx;height:112rpx;border:5rpx solid #82d71a;border-radius:50%;background:#fff;font-size:37rpx;font-weight:800}.score small{font-size:17rpx}.risk label,.risk b{display:block}.risk b{margin:5rpx 0;font-size:32rpx}.risk p{margin:0;color:#62804e;font-size:18rpx}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:13rpx;margin-top:18rpx}.metrics view{padding:18rpx;border-radius:16rpx;background:#f5f8f2}.metrics b,.metrics text{display:block}.metrics b{color:#344d65;font-size:28rpx}.metrics text{margin-top:5rpx;color:#96a4b5;font-size:19rpx}.check{display:flex;align-items:center;gap:18rpx;padding:20rpx 0;border-top:1rpx solid #edf1ed}.check:first-of-type{margin-top:15rpx}.check i{display:flex;align-items:center;justify-content:center;width:48rpx;height:48rpx;border-radius:15rpx;color:#fff;background:#54ae89}.check i.issue{background:#e06972}.check b,.check text{display:block}.check b{color:#41586f;font-size:24rpx}.check text{margin-top:5rpx;color:#96a4b5;font-size:19rpx}.upload{height:75rpx;margin-top:18rpx;border:1rpx solid #73c437;border-radius:16rpx;color:#51aa03;background:#f7fdf1;font-size:22rpx;line-height:75rpx}.files{margin-top:12rpx}.files view{display:flex;justify-content:space-between;padding:12rpx;border-bottom:1rpx solid #edf1eb;color:#4d9d10;font-size:18rpx}.files small{color:#9aa394}textarea{width:100%;height:145rpx;margin-top:15rpx;padding:18rpx;box-sizing:border-box;border:1rpx solid #e5eae2;border-radius:16rpx;background:#f6f8f5}.count{text-align:right;color:#9da9a0;font-size:18rpx}.decisions{display:grid;grid-template-columns:1.4fr 1fr;gap:16rpx;margin:22rpx 0}.decisions button{height:86rpx;border-radius:18rpx;font-size:25rpx;font-weight:700;line-height:86rpx}.accept{color:#fff;background:linear-gradient(135deg,#8bdf1d,#4eae00)}.reject{border:2rpx solid #ef4549;color:#db3338;background:#fff}.result{padding:22rpx;border-radius:18rpx;color:#5c7086;background:#eaf0f6;text-align:center}
+.permission-hint{margin-bottom:22rpx;padding:20rpx 24rpx;border:1rpx solid #f1d294;border-radius:18rpx;color:#a56a08;background:#fff7e5;font-size:22rpx;line-height:1.55}
 </style>

@@ -1,0 +1,21 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "task_id": "WD-20260723-001",
+        "device_id": null,
+        "sample_name": "血液样本批次 A",
+        "status": "pending_pack",
+        "owner_user_id": 2,
+        "carrier_user_id": 3,
+        "receiver_user_id": 4,
+        "updated_at": "2026-07-23T10:00:00+08:00"
+      }
+    ],
+    "page": 1,
+    "page_size": 20,
+    "total": 1
+  }
+}

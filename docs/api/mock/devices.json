@@ -1,0 +1,22 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "device_id": "CLD-001",
+        "device_name": "UniKnect 一号箱",
+        "model": "UniKnect Kit GEN-1 Pro",
+        "status": "online",
+        "current_task_id": "WD-20260723-001",
+        "battery": 86,
+        "last_seen_at": "2026-07-23T10:05:00+08:00",
+        "owner_user_id": 2,
+        "organization": "高校实验室"
+      }
+    ],
+    "page": 1,
+    "page_size": 20,
+    "total": 1
+  }
+}

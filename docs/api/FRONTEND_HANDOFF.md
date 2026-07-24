@@ -1,17 +1,15 @@
-# 第一阶段前端交接说明
+# Web 与小程序正式联调说明
 
 ## 当前阶段
 
-当前交付为第一阶段后端 MVP，只保证 `TASK-001` 演示主链路。Web 管理端和微信小程序共享同一个 FastAPI 后端、同一份任务数据和同一组状态枚举。
-
-正式登录、多任务管理和细粒度权限不属于本阶段。前端可以先用 Mock 独立开发，再切换真实 API 联调。
+当前后端已经支持正式登录、多任务、设备、告警、交接和追溯 MVP。Web 管理端和微信小程序共享同一个 FastAPI 后端、同一份任务数据和同一组状态枚举。`TASK-001` 只保留给旧开发板演示；新账号必须通过“我的任务”接口获取有权访问的任务。
 
 ## 文档入口
 
 - 接口契约：`docs/api/API_CONTRACT.md`
 - Mock 数据：`docs/api/mock/`
-- 本机 Swagger：<http://127.0.0.1:8020/docs>
-- 本机契约接口：<http://127.0.0.1:8020/api/v1/meta/contracts>
+- 本机 Swagger：<http://127.0.0.1:8000/docs>
+- 本机契约接口：<http://127.0.0.1:8000/api/v1/meta/contracts>
 
 `127.0.0.1` 只代表运行后端的那台电脑。其他电脑和手机无法通过自己的 `127.0.0.1` 访问赵耀电脑，前端代码禁止把该地址写死。远程联调地址由赵耀统一提供。
 
@@ -20,7 +18,7 @@
 Web 建议只在环境配置中定义：
 
 ```text
-VITE_API_BASE_URL=http://127.0.0.1:8020
+VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
 微信小程序使用一个统一配置模块或环境变量保存 API 基础地址。任何成员不得在多个页面分别写死后端地址。
@@ -53,9 +51,28 @@ VITE_API_BASE_URL=http://127.0.0.1:8020
 
 温度状态：`TEMP_OK`、`TEMP_ALERT`。
 
-前端角色：`admin`、`sender`、`carrier`、`receiver`。角色在 MVP 中用于界面入口和演示文案，不代表后端已经实现正式权限系统。
+前端角色：`admin`、`sender`、`carrier`、`receiver`。角色用于控制菜单和按钮提示，最终权限始终以后端响应为准。
 
-第一阶段当前流程只产生 `pending_pack`、`in_transit`、`signed`、`rejected`；其余任务状态为后续预留，前端可以准备中文映射，但不要等待本阶段接口生成它们。
+公开注册只允许 `sender`、`carrier`、`receiver`，不能注册 `admin`。所有任务、设备、遥测、告警和报告查询都要携带 Bearer Token；401 清理会话并回登录页，403 显示无权限，404 不应解释为资源一定不存在，409 显示状态冲突。
+
+## 设备联调规则
+
+- 页面不得接收、保存、显示或打印设备密钥。
+- 所有设备响应都不包含 `device_secret` 或 `device_secret_hash`。
+- 创建和编辑任务时不要提交 `device_id`；设备关联只调用 `/api/v1/devices/{device_id}/bind`。
+- 解绑成功后，设备应为 `available`、`current_task_id=null`，任务详情中的 `device_id` 也应为 `null`。
+- 发货方通过 `GET /api/v1/users?role=carrier|receiver` 获取指派候选人，不得调用管理员用户列表。
+- 设备配网后通过受控流程调用 `POST /api/v1/devices/{device_id}/rotate-secret`；返回的新密钥只交付硬件，前端不得持久化。
+
+## 交接、证据和文件
+
+- 任务交接记录统一读取 `GET /api/v1/tasks/{task_id}/handoffs?page&page_size`。
+- 创建交接后，由发起方生成动态二维码，指定接收人扫码调用 `/qr-tokens/verify`。
+- `/handoffs/{handoff_id}/confirm` 在二维码未验证时返回 `40932`，前端不得绕过。
+- 正式签收前必须完成 `carrier_to_receiver` 交接；缺少接收证据返回 `40933`。
+- 人脸相关页面必须标注“模拟核验/人工复核”，不得展示为真实生物识别。
+- 新证据文件调用 `POST /api/v1/files/upload`，使用 multipart；仅允许 JPEG、PNG、PDF，最大 5 MB。
+- 下载必须调用后端返回的 `/api/v1/files/{file_id}/download` 并携带 Token；不得读取或拼接本地磁盘路径。
 
 ## MVP 接口
 
@@ -98,6 +115,17 @@ VITE_API_BASE_URL=http://127.0.0.1:8020
 | --- | --- | --- | --- | --- |
 | GET | `/api/v1/tasks/{task_id}/trace-report` | 任务、监测摘要、告警和交接节点 | `task_id` | `mock/trace-report.json` |
 
+### 新增正式联调接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/v1/users` | 承运方/接收方候选目录 |
+| GET | `/api/v1/tasks/{task_id}/handoffs` | 分页交接记录和证据状态 |
+| POST | `/api/v1/files/upload` | 真实证据文件上传 |
+| GET | `/api/v1/files/{file_id}/download` | 受控文件下载 |
+| GET | `/api/v1/dashboard/summary` | 管理员全局大屏聚合 |
+| POST | `/api/v1/devices/{device_id}/rotate-secret` | 受控设备重新配网 |
+
 ### 旧版兼容接口
 
 | 方法 | 路径 | 用途 | 关键参数 | Mock |
@@ -131,11 +159,11 @@ VITE_API_BASE_URL=http://127.0.0.1:8020
 ## 已知限制
 
 - 当前数据库为 SQLite。
-- 当前以 `TASK-001` 和设备 `CLD-001` 为核心演示链路。
+- `TASK-001` 和 `CLD-001` 仅用于旧开发板演示链路。
 - 本机 `127.0.0.1` 无法被其他电脑或手机直接访问。
 - 远程联调地址后续由赵耀统一提供。
-- 正式登录、细粒度权限、多任务 CRUD、MySQL、GNSS 和 MQTT 不属于第一阶段。
-- 当前写接口没有正式身份认证，不得在无人看管的公网地址上用于真实业务数据；比赛远程联调地址及访问范围由赵耀统一管理。
+- 当前数据库仍为 SQLite，适合竞赛 MVP，不作为生产级高并发方案。
+- 登录、二维码和人脸占位验证已有限流；真实第三方人脸服务仍未接入。
 
 ## 问题反馈格式
 

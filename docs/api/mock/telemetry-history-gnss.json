@@ -1,0 +1,24 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "limit": 100,
+    "cursor": null,
+    "next_cursor": 10,
+    "downsample": 1,
+    "items": [
+      {
+        "id": 10,
+        "device_id": "CLD-001",
+        "task_id": "WD-20260723-001",
+        "sequence": 10,
+        "temperature": 4.2,
+        "humidity": 62.5,
+        "lat": 30.123,
+        "lng": 120.456,
+        "accuracy": 20.0,
+        "timestamp": "2026-07-23T10:05:00+08:00"
+      }
+    ]
+  }
+}

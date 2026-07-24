@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -14,17 +16,10 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Body, FastAPI, Header, Query
+from fastapi import Body, FastAPI, File, Form, Header, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-
-try:
-    import cv2
-    import numpy as np
-except ImportError:  # 生产环境可替换为商业活体/身份核验服务
-    cv2 = None
-    np = None
 
 try:
     import qrcode
@@ -34,9 +29,13 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "device_data.db"))
+FILE_STORAGE_DIR = Path(os.environ.get("FILE_STORAGE_DIR", BASE_DIR / "uploads"))
 CORS_ORIGIN_REGEX = os.environ.get(
     "CORS_ORIGIN_REGEX",
     r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+)
+ALLOW_ADMIN_SELF_REGISTER = (
+    os.environ.get("ALLOW_ADMIN_SELF_REGISTER", "false").strip().lower() == "true"
 )
 LIVE_SNAPSHOT_URL = os.environ.get(
     "LIVE_SNAPSHOT_URL",
@@ -72,6 +71,9 @@ TASK_STATUSES = [
 BOX_STATUSES = ["BOX_OPEN", "BOX_CLOSED"]
 MOVE_STATUSES = ["STABLE", "MILD", "SEVERE", "IMPACT", "FREE_FALL"]
 TEMPERATURE_STATUSES = ["TEMP_OK", "TEMP_ALERT"]
+DEVICE_STATUSES = ["available", "bound", "online", "offline"]
+ALARM_STATUSES = ["new", "acknowledged", "resolved"]
+HANDOFF_STATUSES = ["pending", "confirmed", "rejected"]
 
 TASK_STATUS_LABELS = {
     "pending_pack": "待发出",
@@ -108,6 +110,16 @@ EVENT_DISPLAY_LABELS = {
 
 LOW_BATTERY_THRESHOLD = 20
 DEVICE_OFFLINE_SECONDS = 300
+DEVICE_OFFLINE_SCAN_SECONDS = int(os.environ.get("DEVICE_OFFLINE_SCAN_SECONDS", "60"))
+LOGIN_RATE_LIMIT = 6
+VERIFY_RATE_LIMIT = 10
+RATE_LIMIT_WINDOW_SECONDS = 60
+MAX_EVIDENCE_FILE_SIZE = 5 * 1024 * 1024
+ALLOWED_EVIDENCE_TYPES = {
+    "image/jpeg": (".jpg", ".jpeg"),
+    "image/png": (".png",),
+    "application/pdf": (".pdf",),
+}
 
 AUTH_ROLES = ["admin", "sender", "carrier", "receiver"]
 ROLE_PERMISSIONS = {
@@ -120,8 +132,10 @@ ROLE_PERMISSIONS = {
         "view_alarm",
         "upload_location",
         "manage_user",
+        "manage_device",
+        "manage_alarm",
     ],
-    "sender": ["view_task", "start_task", "view_report"],
+    "sender": ["view_task", "start_task", "view_report", "manage_device"],
     "carrier": ["view_task", "view_alarm", "upload_location"],
     "receiver": ["view_task", "sign_task", "reject_task", "view_report"],
 }
@@ -206,7 +220,6 @@ class CreateHandoffIn(BaseModel):
 
 class HandoffConfirmIn(BaseModel):
     location: Optional[LocationIn] = None
-    note: Optional[str] = Field(None, max_length=200)
 
 
 class HandoffRejectIn(BaseModel):
@@ -235,12 +248,11 @@ class FaceEnrollIn(BaseModel):
 
 class FaceVerifyIn(BaseModel):
     handoff_id: str = Field(..., min_length=1, max_length=80)
-    image_base64: Optional[str] = None
     qr_token: Optional[str] = Field(None, max_length=160)
     capture_file_id: Optional[str] = Field(None, max_length=80)
     liveness_token: Optional[str] = Field(None, max_length=160)
     liveness_passed: bool = False
-    similarity_score: float = Field(default=0, ge=0, le=1)
+    similarity_score: float = Field(..., ge=0, le=1)
     location: Optional[LocationIn] = None
 
 
@@ -326,9 +338,34 @@ def normalize_query_time(value: Optional[str]) -> Optional[str]:
     return value.replace(" ", "+") if value else value
 
 
+REQUEST_CONNECTIONS: ContextVar[Optional[list[sqlite3.Connection]]] = ContextVar(
+    "request_connections",
+    default=None,
+)
+
+
+class ClosingConnection(sqlite3.Connection):
+    """SQLite 上下文退出时提交/回滚并真正释放 Windows 文件句柄。"""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = super().__exit__(exc_type, exc_value, traceback)
+        # 请求内的旧接口有少量逻辑在 with 块后继续读取同一连接，
+        # 由 HTTP 中间件统一关闭；脚本/测试直接调用时则在此立即关闭。
+        if REQUEST_CONNECTIONS.get() is None:
+            self.close()
+        return result
+
+
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(
+        DATABASE_PATH,
+        check_same_thread=False,
+        factory=ClosingConnection,
+    )
     conn.row_factory = sqlite3.Row
+    request_connections = REQUEST_CONNECTIONS.get()
+    if request_connections is not None:
+        request_connections.append(conn)
     return conn
 
 
@@ -337,151 +374,44 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 
 
 def fetch_live_hardware_snapshot() -> dict:
-    """读取远端真实硬件快照，短时缓存避免多个页面重复请求设备服务。"""
+    """读取真实硬件聚合快照，并短时缓存以避免页面轮询压垮设备服务。"""
     global _live_snapshot_cache
-    now = time.monotonic()
+    monotonic_now = time.monotonic()
     if (
         _live_snapshot_cache
-        and now - _live_snapshot_cache[0] < LIVE_SNAPSHOT_CACHE_SECONDS
+        and monotonic_now - _live_snapshot_cache[0] < LIVE_SNAPSHOT_CACHE_SECONDS
     ):
         return _live_snapshot_cache[1]
-    request = urllib.request.Request(
+    live_request = urllib.request.Request(
         LIVE_SNAPSHOT_URL,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "coldchain-backend/0.2",
-        },
+        headers={"Accept": "application/json", "User-Agent": "coldchain-backend/1.0"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=LIVE_SNAPSHOT_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            live_request, timeout=LIVE_SNAPSHOT_TIMEOUT
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         raise RuntimeError(f"live hardware snapshot unavailable: {exc}") from exc
     if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
         raise RuntimeError("live hardware snapshot returned invalid response")
     data = payload["data"]
-    _live_snapshot_cache = (now, data)
+    _live_snapshot_cache = (monotonic_now, data)
     return data
 
 
-def migrate_legacy_users_table(conn: sqlite3.Connection) -> None:
-    table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
-    ).fetchone()
-    if not table:
-        return
-    columns = {
-        row["name"]: row
-        for row in conn.execute("PRAGMA table_info(users)").fetchall()
-    }
-    if {"username", "salt", "display_name"}.issubset(columns) and (
-        columns["id"]["type"] or ""
-    ).upper() == "INTEGER":
-        return
-
-    legacy_rows = conn.execute("SELECT * FROM users ORDER BY rowid").fetchall()
-    conn.execute("DROP TABLE IF EXISTS users_v2_migration")
-    conn.execute(
-        """
-        CREATE TABLE users_v2_migration (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            role TEXT NOT NULL,
-            display_name TEXT,
-            created_at TEXT NOT NULL,
-            phone TEXT,
-            name TEXT,
-            organization TEXT,
-            status TEXT
-        )
-        """
-    )
-    id_mapping = {}
-    used_usernames = set()
-    for index, row in enumerate(legacy_rows, start=1):
-        item = row_to_dict(row)
-        username = str(item.get("username") or item.get("phone") or f"legacy_user_{index}")
-        original_username = username
-        suffix = 2
-        while username in used_usernames:
-            username = f"{original_username}_{suffix}"
-            suffix += 1
-        used_usernames.add(username)
-        cursor = conn.execute(
-            """
-            INSERT INTO users_v2_migration (
-                username, password_hash, salt, role, display_name, created_at,
-                phone, name, organization, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                username,
-                item.get("password_hash") or "",
-                item.get("salt") or item.get("password_salt") or "",
-                item.get("role") or "sender",
-                item.get("display_name") or item.get("name") or username,
-                item.get("created_at") or now_iso(),
-                item.get("phone") or username,
-                item.get("name") or item.get("display_name") or username,
-                item.get("organization") or "",
-                item.get("status") or "active",
-            ),
-        )
-        id_mapping[str(item.get("id"))] = cursor.lastrowid
-
-    task_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_handoff'"
-    ).fetchone()
-    if task_table:
-        task_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(task_handoff)").fetchall()
-        }
-        for column in {"owner_user_id", "carrier_user_id", "receiver_user_id"} & task_columns:
-            for old_id, new_id in id_mapping.items():
-                conn.execute(
-                    f"UPDATE task_handoff SET {column} = ? WHERE CAST({column} AS TEXT) = ?",
-                    (new_id, old_id),
-                )
-
-    token_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'auth_tokens'"
-    ).fetchone()
-    if token_table:
-        conn.execute("DELETE FROM auth_tokens")
-    conn.execute("DROP TABLE users")
-    conn.execute("ALTER TABLE users_v2_migration RENAME TO users")
-
-
-def migrate_legacy_auth_tokens_table(conn: sqlite3.Connection) -> None:
-    table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'auth_tokens'"
-    ).fetchone()
-    if not table:
-        return
-    columns = {
-        row["name"]: row
-        for row in conn.execute("PRAGMA table_info(auth_tokens)").fetchall()
-    }
-    is_current = (
-        set(columns) == {"token", "user_id", "created_at"}
-        and (columns["user_id"]["type"] or "").upper() == "INTEGER"
-    )
-    if is_current:
-        return
-    conn.execute("DROP TABLE auth_tokens")
-    conn.execute(
-        """
-        CREATE TABLE auth_tokens (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
+def qr_image_data_url(payload: str) -> Optional[str]:
+    if qrcode is None:
+        return None
+    image = qrcode.make(payload)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def init_db() -> None:
@@ -540,7 +470,6 @@ def init_db() -> None:
             )
             """
         )
-        migrate_legacy_users_table(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -554,7 +483,6 @@ def init_db() -> None:
             )
             """
         )
-        migrate_legacy_auth_tokens_table(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -621,7 +549,6 @@ def init_db() -> None:
                 location_lng REAL,
                 location_accuracy REAL,
                 reason TEXT,
-                note TEXT,
                 certificate_no TEXT,
                 trace_hash TEXT,
                 created_at TEXT NOT NULL,
@@ -783,6 +710,17 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                scope TEXT NOT NULL,
+                identity_hash TEXT NOT NULL,
+                window_started_at TEXT NOT NULL,
+                request_count INTEGER NOT NULL,
+                PRIMARY KEY(scope, identity_hash)
+            )
+            """
+        )
         ensure_column(conn, "device_data", "sequence", "INTEGER")
         ensure_column(conn, "device_data", "battery", "INTEGER")
         ensure_column(conn, "device_data", "lat", "REAL")
@@ -818,11 +756,13 @@ def init_db() -> None:
         ensure_column(conn, "users", "organization", "TEXT")
         ensure_column(conn, "users", "status", "TEXT")
         ensure_column(conn, "devices", "device_secret_hash", "TEXT")
-        ensure_column(conn, "handoffs", "note", "TEXT")
-        migrate_qr_tokens_schema(conn)
-        migrate_face_verifications_schema(conn)
+        ensure_column(conn, "devices", "owner_user_id", "INTEGER")
+        ensure_column(conn, "devices", "organization", "TEXT")
+        ensure_column(conn, "qr_tokens", "verified_by_user_id", "INTEGER")
+        ensure_column(conn, "files", "storage_path", "TEXT")
         ensure_demo_task(conn)
         migrate_task_status_column(conn)
+    conn.close()
 
 
 def ensure_column(
@@ -836,208 +776,7 @@ def ensure_column(
         for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     }
     if column_name not in columns:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
-        )
-
-
-def migrate_qr_tokens_schema(conn: sqlite3.Connection) -> None:
-    """将旧版二维码表迁移到动态二维码所需结构，并保留可关联的历史记录。"""
-    columns = {
-        row["name"]: row["type"]
-        for row in conn.execute("PRAGMA table_info(qr_tokens)").fetchall()
-    }
-    required = {
-        "id",
-        "token_hash",
-        "task_id",
-        "handoff_id",
-        "action",
-        "issuer_user_id",
-        "nonce",
-        "status",
-        "expires_at",
-        "consumed_at",
-        "revoked_at",
-        "created_at",
-    }
-    if required.issubset(columns) and columns.get("id", "").upper() == "INTEGER":
-        return
-
-    legacy_rows = [
-        row_to_dict(row)
-        for row in conn.execute("SELECT * FROM qr_tokens").fetchall()
-    ]
-    conn.execute("ALTER TABLE qr_tokens RENAME TO qr_tokens_legacy_migration")
-    conn.execute(
-        """
-        CREATE TABLE qr_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_hash TEXT NOT NULL UNIQUE,
-            task_id TEXT NOT NULL,
-            handoff_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            issuer_user_id INTEGER,
-            nonce TEXT NOT NULL,
-            status TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            consumed_at TEXT,
-            revoked_at TEXT,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    for legacy in legacy_rows:
-        handoff = conn.execute(
-            "SELECT task_id, from_user_id FROM handoffs WHERE handoff_id = ?",
-            (legacy.get("handoff_id"),),
-        ).fetchone()
-        task_id = legacy.get("task_id") or (handoff["task_id"] if handoff else None)
-        if not task_id:
-            continue
-        status = legacy.get("status")
-        if not status:
-            status = (
-                "consumed"
-                if legacy.get("consumed_at")
-                else "revoked"
-                if legacy.get("revoked_at")
-                else "active"
-            )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO qr_tokens (
-                token_hash, task_id, handoff_id, action, issuer_user_id,
-                nonce, status, expires_at, consumed_at, revoked_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                legacy["token_hash"],
-                task_id,
-                legacy["handoff_id"],
-                legacy.get("action") or "handoff_send",
-                legacy.get("issuer_user_id")
-                or (handoff["from_user_id"] if handoff else None),
-                legacy.get("nonce") or str(legacy.get("id") or secrets.token_hex(12)),
-                status,
-                legacy["expires_at"],
-                legacy.get("consumed_at"),
-                legacy.get("revoked_at"),
-                legacy["created_at"],
-            ),
-        )
-    conn.execute("DROP TABLE qr_tokens_legacy_migration")
-
-
-def migrate_face_verifications_schema(conn: sqlite3.Connection) -> None:
-    """兼容旧版 OpenCV 检测记录，并升级为新版活体/相似度验证结构。"""
-    columns = {
-        row["name"]: row["type"]
-        for row in conn.execute("PRAGMA table_info(face_verifications)").fetchall()
-    }
-    required = {
-        "id",
-        "verification_id",
-        "user_id",
-        "handoff_id",
-        "liveness_passed",
-        "similarity_score",
-        "threshold",
-        "verified",
-        "manual_review_required",
-        "status",
-        "created_at",
-    }
-    if required.issubset(columns) and columns.get("id", "").upper() == "INTEGER":
-        return
-
-    legacy_rows = [
-        row_to_dict(row)
-        for row in conn.execute("SELECT * FROM face_verifications").fetchall()
-    ]
-    conn.execute(
-        "ALTER TABLE face_verifications RENAME TO face_verifications_legacy_migration"
-    )
-    conn.execute(
-        """
-        CREATE TABLE face_verifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            verification_id TEXT NOT NULL UNIQUE,
-            user_id INTEGER NOT NULL,
-            handoff_id TEXT NOT NULL,
-            qr_token TEXT,
-            capture_file_id TEXT,
-            liveness_token TEXT,
-            liveness_passed INTEGER NOT NULL,
-            similarity_score REAL NOT NULL,
-            threshold REAL NOT NULL,
-            verified INTEGER NOT NULL,
-            manual_review_required INTEGER NOT NULL,
-            location_lat REAL,
-            location_lng REAL,
-            location_accuracy REAL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    for legacy in legacy_rows:
-        raw_user_id = legacy.get("user_id")
-        try:
-            user_id = int(raw_user_id)
-        except (TypeError, ValueError):
-            user = conn.execute(
-                """
-                SELECT id FROM users
-                WHERE username = ? OR phone = ? OR name = ? OR display_name = ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (raw_user_id, raw_user_id, raw_user_id, raw_user_id),
-            ).fetchone()
-            user_id = user["id"] if user else None
-        if not user_id or not legacy.get("handoff_id"):
-            continue
-        score = float(legacy.get("similarity_score") or legacy.get("quality_score") or 0)
-        if score > 1:
-            score /= 100
-        score = min(1.0, max(0.0, score))
-        liveness_passed = bool(
-            legacy.get("liveness_passed", legacy.get("detected", False))
-        )
-        threshold = float(legacy.get("threshold") or 0.72)
-        verified = bool(legacy.get("verified", liveness_passed and score >= threshold))
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO face_verifications (
-                verification_id, user_id, handoff_id, qr_token,
-                capture_file_id, liveness_token, liveness_passed,
-                similarity_score, threshold, verified,
-                manual_review_required, location_lat, location_lng,
-                location_accuracy, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                legacy.get("verification_id")
-                or legacy.get("id")
-                or f"FV-{secrets.token_hex(8).upper()}",
-                user_id,
-                legacy["handoff_id"],
-                legacy.get("qr_token"),
-                legacy.get("capture_file_id"),
-                legacy.get("liveness_token"),
-                int(liveness_passed),
-                score,
-                threshold,
-                int(verified),
-                int(legacy.get("manual_review_required", not verified)),
-                legacy.get("location_lat"),
-                legacy.get("location_lng"),
-                legacy.get("location_accuracy"),
-                legacy.get("status") or ("verified" if verified else "pending_review"),
-                legacy["created_at"],
-            ),
-        )
-    conn.execute("DROP TABLE face_verifications_legacy_migration")
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def migrate_task_status_column(conn: sqlite3.Connection) -> None:
@@ -1095,14 +834,39 @@ def ensure_demo_task(conn: sqlite3.Connection) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    monitor_task = asyncio.create_task(offline_device_monitor())
+    try:
+        yield
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
     title="Cold Chain Traceability Backend",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def close_request_database_connections(request, call_next):
+    connections: list[sqlite3.Connection] = []
+    token = REQUEST_CONNECTIONS.set(connections)
+    try:
+        return await call_next(request)
+    finally:
+        REQUEST_CONNECTIONS.reset(token)
+        for connection in connections:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=CORS_ORIGIN_REGEX,
@@ -1137,7 +901,9 @@ def detect_event(data: DeviceDataIn) -> str:
     return "NORMAL"
 
 
-def build_event_items(data: DeviceDataIn, event_type: str) -> list[tuple[str, str, str]]:
+def build_event_items(
+    data: DeviceDataIn, event_type: str
+) -> list[tuple[str, str, str]]:
     events = []
     box_status = data.box_status.upper()
     move_status = data.move_status.upper()
@@ -1364,8 +1130,10 @@ def verify_device_signature(
         "SELECT * FROM devices WHERE device_id = ?",
         (payload_device_id,),
     ).fetchone()
-    if not device or not device["device_secret_hash"]:
-        return None
+    if not device:
+        return api_error(401, 40125, "unknown device")
+    if not device["device_secret_hash"]:
+        return api_error(401, 40126, "device is not provisioned")
     if not all([x_device_id, x_timestamp, x_nonce, x_signature]):
         return api_error(401, 40120, "device signature required")
     if x_device_id != payload_device_id:
@@ -1406,7 +1174,9 @@ def verify_device_signature(
     return None
 
 
-def telemetry_temp_status(payload: DeviceTelemetryIn, task: Optional[sqlite3.Row]) -> str:
+def telemetry_temp_status(
+    payload: DeviceTelemetryIn, task: Optional[sqlite3.Row]
+) -> str:
     if payload.temp_status:
         return payload.temp_status
     if task:
@@ -1446,6 +1216,55 @@ def api_error(status_code: int, code: int, message: str) -> JSONResponse:
         status_code=status_code,
         content={"code": code, "message": message, "data": None},
     )
+
+
+def check_rate_limit(
+    conn: sqlite3.Connection,
+    scope: str,
+    identity: str,
+    limit: int,
+    window_seconds: int = RATE_LIMIT_WINDOW_SECONDS,
+) -> Optional[JSONResponse]:
+    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).astimezone()
+    row = conn.execute(
+        """
+        SELECT * FROM rate_limits
+        WHERE scope = ? AND identity_hash = ?
+        """,
+        (scope, identity_hash),
+    ).fetchone()
+    if row:
+        window_started = datetime.fromisoformat(row["window_started_at"])
+        if (now - window_started).total_seconds() < window_seconds:
+            if row["request_count"] >= limit:
+                response = api_error(429, 42901, "too many requests")
+                response.headers["Retry-After"] = str(
+                    max(1, window_seconds - int((now - window_started).total_seconds()))
+                )
+                return response
+            conn.execute(
+                """
+                UPDATE rate_limits
+                SET request_count = request_count + 1
+                WHERE scope = ? AND identity_hash = ?
+                """,
+                (scope, identity_hash),
+            )
+            return None
+    conn.execute(
+        """
+        INSERT INTO rate_limits (
+            scope, identity_hash, window_started_at, request_count
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(scope, identity_hash) DO UPDATE SET
+            window_started_at = excluded.window_started_at,
+            request_count = excluded.request_count
+        """,
+        (scope, identity_hash, now.isoformat(timespec="seconds"), 1),
+    )
+    return None
 
 
 def get_idempotent_result(
@@ -1494,8 +1313,24 @@ def get_user_row(conn: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row
     return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+DEVICE_RESPONSE_FIELDS = {
+    "device_id",
+    "device_name",
+    "model",
+    "status",
+    "current_task_id",
+    "battery",
+    "last_seen_at",
+    "created_at",
+    "updated_at",
+    "owner_user_id",
+    "organization",
+}
+
+
 def serialize_device(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
+    raw = row_to_dict(row)
+    item = {key: raw.get(key) for key in DEVICE_RESPONSE_FIELDS}
     last_seen_at = item.get("last_seen_at")
     if last_seen_at and item.get("status") in {"online", "bound"}:
         try:
@@ -1506,6 +1341,20 @@ def serialize_device(row: sqlite3.Row) -> dict:
         except ValueError:
             pass
     return item
+
+
+def can_manage_device(user: dict, device: dict) -> bool:
+    return user["role"] == "admin" or device.get("owner_user_id") == user["user_id"]
+
+
+def can_view_device(conn: sqlite3.Connection, user: dict, device: dict) -> bool:
+    if can_manage_device(user, device):
+        return True
+    task_id = device.get("current_task_id")
+    if not task_id:
+        return False
+    task = get_task_by_id(conn, task_id)
+    return bool(task and can_view_task(user, serialize_task(task)))
 
 
 def ensure_task_offline_alarm(conn: sqlite3.Connection, task: sqlite3.Row) -> None:
@@ -1547,6 +1396,62 @@ def ensure_task_offline_alarm(conn: sqlite3.Connection, task: sqlite3.Row) -> No
     )
 
 
+def scan_offline_devices() -> int:
+    created = 0
+    connection = get_connection()
+    try:
+        with connection as conn:
+            tasks = conn.execute(
+                """
+                SELECT task_handoff.*
+                FROM task_handoff
+                JOIN devices ON devices.current_task_id = task_handoff.task_id
+                WHERE devices.last_seen_at IS NOT NULL
+                """
+            ).fetchall()
+            for task in tasks:
+                device = conn.execute(
+                    "SELECT * FROM devices WHERE current_task_id = ?",
+                    (task["task_id"],),
+                ).fetchone()
+                if device and serialize_device(device)["status"] == "offline":
+                    conn.execute(
+                        """
+                        UPDATE devices
+                        SET status = ?, updated_at = ?
+                        WHERE device_id = ?
+                        """,
+                        ("offline", now_iso(), device["device_id"]),
+                    )
+                before = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM event_log
+                    WHERE task_id = ? AND event_type = ?
+                      AND COALESCE(alarm_status, 'new') != ?
+                    """,
+                    (task["task_id"], "DEVICE_OFFLINE", "resolved"),
+                ).fetchone()["count"]
+                ensure_task_offline_alarm(conn, task)
+                after = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM event_log
+                    WHERE task_id = ? AND event_type = ?
+                      AND COALESCE(alarm_status, 'new') != ?
+                    """,
+                    (task["task_id"], "DEVICE_OFFLINE", "resolved"),
+                ).fetchone()["count"]
+                created += max(0, after - before)
+        return created
+    finally:
+        connection.close()
+
+
+async def offline_device_monitor() -> None:
+    while True:
+        await asyncio.sleep(DEVICE_OFFLINE_SCAN_SECONDS)
+        await asyncio.to_thread(scan_offline_devices)
+
+
 def serialize_binding(row: sqlite3.Row) -> dict:
     return row_to_dict(row)
 
@@ -1557,42 +1462,58 @@ def serialize_handoff(row: sqlite3.Row) -> dict:
     return item
 
 
-def enrich_handoff(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def minimal_user_display(row: Optional[sqlite3.Row]) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "user_id": row["id"],
+        "name": row["name"] or row["display_name"] or row["username"],
+        "organization": row["organization"] or "",
+        "role": row["role"],
+    }
+
+
+def serialize_handoff_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     item = serialize_handoff(row)
-    item["issuer_user_id"] = item["from_user_id"]
-    item["recipient_user_id"] = item["to_user_id"]
-    qr_row = conn.execute(
+    item["from_user"] = minimal_user_display(
+        get_user_row(conn, item["from_user_id"]) if item.get("from_user_id") else None
+    )
+    item["to_user"] = minimal_user_display(get_user_row(conn, item["to_user_id"]))
+    qr = conn.execute(
         """
-        SELECT consumed_at, expires_at, action FROM qr_tokens
+        SELECT id, status, consumed_at, verified_by_user_id
+        FROM qr_tokens
         WHERE handoff_id = ?
-        ORDER BY id DESC LIMIT 1
+        ORDER BY id DESC
+        LIMIT 1
         """,
         (item["handoff_id"],),
     ).fetchone()
-    face_rows = conn.execute(
+    face = conn.execute(
         """
-        SELECT * FROM face_verifications
-        WHERE handoff_id = ? AND verified = 1
+        SELECT verification_id, status, verified, manual_review_required
+        FROM face_verifications
+        WHERE handoff_id = ?
         ORDER BY id DESC
+        LIMIT 1
         """,
         (item["handoff_id"],),
-    ).fetchall()
-    faces = {}
-    for face_row in face_rows:
-        party = "issuer" if face_row["user_id"] == item["from_user_id"] else "recipient"
-        if party not in faces:
-            face = serialize_face_verification(face_row)
-            faces[party] = {
-                "verified": True,
-                "quality_score": face["similarity_score"],
-                "verified_at": face["created_at"],
-            }
-    item["faces"] = faces
-    item["qr_verified_at"] = qr_row["consumed_at"] if qr_row else None
-    item["expires_at"] = qr_row["expires_at"] if qr_row else None
-    item["action"] = qr_row["action"] if qr_row else item["handoff_type"]
-    if item["status"] == "pending" and qr_row and qr_row["consumed_at"]:
-        item["status"] = "qr_verified"
+    ).fetchone()
+    evidence_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM files
+        WHERE related_type = ? AND related_id = ?
+        """,
+        ("handoff", item["handoff_id"]),
+    ).fetchone()["count"]
+    item["evidence"] = {
+        "qr_verified": bool(qr and qr["status"] == "consumed" and qr["consumed_at"]),
+        "qr_verified_by_user_id": qr["verified_by_user_id"] if qr else None,
+        "face_status": face["status"] if face else "not_submitted",
+        "face_verified": bool(face and face["verified"]),
+        "face_manual_review_required": bool(face and face["manual_review_required"]),
+        "file_count": evidence_count,
+    }
     return item
 
 
@@ -1601,13 +1522,57 @@ def serialize_audit_log(row: sqlite3.Row) -> dict:
 
 
 def serialize_qr_token(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
+    raw = row_to_dict(row)
+    item = {
+        key: raw.get(key)
+        for key in {
+            "id",
+            "task_id",
+            "handoff_id",
+            "action",
+            "issuer_user_id",
+            "verified_by_user_id",
+            "status",
+            "expires_at",
+            "consumed_at",
+            "revoked_at",
+            "created_at",
+        }
+    }
     item["token_id"] = item["id"]
     return item
 
 
 def serialize_file(row: sqlite3.Row) -> dict:
-    return row_to_dict(row)
+    raw = row_to_dict(row)
+    return {
+        key: raw.get(key)
+        for key in {
+            "id",
+            "file_id",
+            "task_id",
+            "file_name",
+            "file_type",
+            "file_size",
+            "sha256",
+            "usage",
+            "related_type",
+            "related_id",
+            "storage_url",
+            "uploader_user_id",
+            "created_at",
+        }
+    }
+
+
+def valid_file_signature(content_type: str, content: bytes) -> bool:
+    if content_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if content_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if content_type == "application/pdf":
+        return content.startswith(b"%PDF-")
+    return False
 
 
 def serialize_notification(row: sqlite3.Row) -> dict:
@@ -1625,7 +1590,27 @@ def serialize_face_profile(row: Optional[sqlite3.Row]) -> dict:
 
 
 def serialize_face_verification(row: sqlite3.Row) -> dict:
-    item = row_to_dict(row)
+    raw = row_to_dict(row)
+    item = {
+        key: raw.get(key)
+        for key in {
+            "id",
+            "verification_id",
+            "user_id",
+            "handoff_id",
+            "capture_file_id",
+            "liveness_passed",
+            "similarity_score",
+            "threshold",
+            "verified",
+            "manual_review_required",
+            "location_lat",
+            "location_lng",
+            "location_accuracy",
+            "status",
+            "created_at",
+        }
+    }
     item["liveness_passed"] = bool(item["liveness_passed"])
     item["verified"] = bool(item["verified"])
     item["manual_review_required"] = bool(item["manual_review_required"])
@@ -1709,7 +1694,14 @@ def record_status_history(
         )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (task_id, from_status, to_status, reason, actor_user_id, changed_at or now_iso()),
+        (
+            task_id,
+            from_status,
+            to_status,
+            reason,
+            actor_user_id,
+            changed_at or now_iso(),
+        ),
     )
 
 
@@ -1746,53 +1738,17 @@ def canonical_body_hash(payload: BaseModel) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def device_signature(secret: str, device_id: str, timestamp: str, nonce: str, payload: BaseModel) -> str:
+def device_signature(
+    secret: str, device_id: str, timestamp: str, nonce: str, payload: BaseModel
+) -> str:
     message = f"{device_id}.{timestamp}.{nonce}.{canonical_body_hash(payload)}"
-    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.new(
+        secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def hash_qr_token(token: str) -> str:
     return hash_token_value(token)
-
-
-def qr_image_data_url(payload: str) -> Optional[str]:
-    if qrcode is None:
-        return None
-    image = qrcode.make(payload)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
-def detect_face_image(image_base64: str) -> dict:
-    if cv2 is None or np is None:
-        raise ValueError("OpenCV face detector is unavailable")
-    raw_value = image_base64.split(",", 1)[-1]
-    try:
-        raw = base64.b64decode(raw_value, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("invalid face image") from exc
-    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("invalid face image")
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    detector = cv2.CascadeClassifier(cascade_path)
-    faces = detector.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(80, 80),
-    )
-    image_area = max(1, image.shape[0] * image.shape[1])
-    largest_area = max((width * height for _, _, width, height in faces), default=0)
-    quality = min(0.99, round(0.9 + min(0.09, largest_area / image_area), 3))
-    return {
-        "face_count": len(faces),
-        "quality_score": quality if len(faces) == 1 else 0,
-        "passed": len(faces) == 1,
-    }
 
 
 def build_trace_hash(*parts: object) -> str:
@@ -1818,7 +1774,11 @@ def build_simple_pdf(lines: list[str]) -> bytes:
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Length "
+        + str(len(stream)).encode("ascii")
+        + b" >>\nstream\n"
+        + stream
+        + b"\nendstream",
     ]
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = [0]
@@ -1855,19 +1815,6 @@ def legacy_hash_password(password: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
 
 
-def ljy_legacy_hash_password(password: str, salt: str) -> Optional[str]:
-    try:
-        salt_bytes = bytes.fromhex(salt)
-    except (ValueError, TypeError):
-        return None
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt_bytes,
-        210_000,
-    ).hex()
-
-
 def verify_password(password: str, salt: str, stored_hash: str) -> bool:
     if stored_hash.startswith("pbkdf2_sha256$"):
         try:
@@ -1881,9 +1828,6 @@ def verify_password(password: str, salt: str, stored_hash: str) -> bool:
         except (ValueError, TypeError):
             return False
         return secrets.compare_digest(calculated, digest)
-    ljy_hash = ljy_legacy_hash_password(password, salt)
-    if ljy_hash and secrets.compare_digest(ljy_hash, stored_hash):
-        return True
     return secrets.compare_digest(legacy_hash_password(password, salt), stored_hash)
 
 
@@ -1956,21 +1900,17 @@ def can_view_task(user: Optional[dict], task: dict) -> bool:
         return task["task_id"] == DEMO_TASK["task_id"]
     if user["role"] == "admin":
         return True
-    user_id = str(user["user_id"])
-    if task.get("owner_user_id") is not None and str(task["owner_user_id"]) == user_id:
+    if task.get("owner_user_id") == user["user_id"]:
         return True
-    if task.get("carrier_user_id") is not None and str(task["carrier_user_id"]) == user_id:
+    if task.get("carrier_user_id") == user["user_id"]:
         return True
-    if task.get("receiver_user_id") is not None and str(task["receiver_user_id"]) == user_id:
+    if task.get("receiver_user_id") == user["user_id"]:
         return True
     return False
 
 
 def can_modify_task(user: dict, task: dict) -> bool:
-    return user["role"] == "admin" or (
-        task.get("owner_user_id") is not None
-        and str(task["owner_user_id"]) == str(user["user_id"])
-    )
+    return user["role"] == "admin" or task.get("owner_user_id") == user["user_id"]
 
 
 def canonical_task_status(task: dict) -> str:
@@ -1991,6 +1931,12 @@ def canonical_task_status(task: dict) -> str:
 
 def serialize_task(row: sqlite3.Row) -> dict:
     task = row_to_dict(row)
+    # 兼容早期 SQLite 表中以 TEXT 保存的责任人 ID，避免 "5" 与 5
+    # 在权限判断时被当成不同用户而错误返回 404。
+    for field in ("owner_user_id", "carrier_user_id", "receiver_user_id"):
+        value = task.get(field)
+        if isinstance(value, str) and value.strip().isdigit():
+            task[field] = int(value.strip())
     task["status"] = canonical_task_status(task)
     if task.get("precheck_passed") is not None:
         task["precheck_passed"] = bool(task["precheck_passed"])
@@ -2361,6 +2307,15 @@ def get_v1_contracts() -> dict:
             "box_statuses": BOX_STATUSES,
             "move_statuses": MOVE_STATUSES,
             "temperature_statuses": TEMPERATURE_STATUSES,
+            "device_statuses": DEVICE_STATUSES,
+            "alarm_statuses": ALARM_STATUSES,
+            "handoff_statuses": HANDOFF_STATUSES,
+            "handoff_confirmation_requirements": {
+                "qr_verified": True,
+                "face_verification": "optional_placeholder",
+            },
+            "evidence_file_types": sorted(ALLOWED_EVIDENCE_TYPES),
+            "evidence_file_max_bytes": MAX_EVIDENCE_FILE_SIZE,
             "auth_roles": AUTH_ROLES,
             "role_permissions": ROLE_PERMISSIONS,
             "timestamp_format": "ISO 8601",
@@ -2375,6 +2330,8 @@ def register_user(payload: RegisterIn):
     role = payload.role.strip().lower()
     if role not in AUTH_ROLES:
         return api_error(422, 42202, "invalid role")
+    if role == "admin" and not ALLOW_ADMIN_SELF_REGISTER:
+        return api_error(403, 40303, "admin self-registration disabled")
     username = (payload.username or payload.phone or "").strip()
     if not username:
         return api_error(422, 42203, "username or phone required")
@@ -2433,6 +2390,68 @@ def register_user(payload: RegisterIn):
     return api_success({"user": serialize_user(row)}, "registered")
 
 
+@app.get("/api/v1/users")
+def list_v1_assignment_candidates(
+    role: str = Query(...),
+    keyword: Optional[str] = Query(default=None),
+    organization: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if user["role"] not in {"sender", "admin"}:
+        return api_error(403, 40301, "forbidden")
+    role = role.strip().lower()
+    if role not in {"carrier", "receiver"}:
+        return api_error(422, 42202, "role must be carrier or receiver")
+
+    conditions = ["role = ?", "COALESCE(status, 'active') = 'active'"]
+    params: list[object] = [role]
+    if keyword:
+        conditions.append(
+            "(LOWER(COALESCE(name, display_name, username)) LIKE ? "
+            "OR LOWER(COALESCE(organization, '')) LIKE ?)"
+        )
+        search = f"%{keyword.strip().lower()}%"
+        params.extend([search, search])
+    if organization:
+        conditions.append("organization = ?")
+        params.append(organization.strip())
+
+    with get_connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS count FROM users WHERE {' AND '.join(conditions)}",
+            params,
+        ).fetchone()["count"]
+        rows = conn.execute(
+            f"""
+            SELECT * FROM users
+            WHERE {' AND '.join(conditions)}
+            ORDER BY COALESCE(name, display_name, username), id
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+    items = [
+        {
+            "user_id": row["id"],
+            "name": row["name"] or row["display_name"] or row["username"],
+            "display_name": row["display_name"] or row["username"],
+            "organization": row["organization"] or "",
+            "role": row["role"],
+            "status": row["status"] or "active",
+        }
+        for row in rows
+    ]
+    return api_success(
+        {"items": items, "page": page, "page_size": page_size, "total": total}
+    )
+
+
 @app.post("/api/v1/auth/login")
 def login_user(payload: LoginIn):
     init_db()
@@ -2440,6 +2459,14 @@ def login_user(payload: LoginIn):
     if not account:
         return api_error(422, 42203, "username or phone required")
     with get_connection() as conn:
+        rate_error = check_rate_limit(
+            conn,
+            "auth.login",
+            account.lower(),
+            LOGIN_RATE_LIMIT,
+        )
+        if rate_error:
+            return rate_error
         row = conn.execute(
             "SELECT * FROM users WHERE username = ? OR phone = ?",
             (account, account),
@@ -2599,6 +2626,12 @@ def receive_v1_device_telemetry(
         )
         if signature_error:
             return signature_error
+        device = conn.execute(
+            "SELECT current_task_id FROM devices WHERE device_id = ?",
+            (payload.device_id,),
+        ).fetchone()
+        if not device or device["current_task_id"] != payload.task_id:
+            return api_error(409, 40920, "device does not match task")
         task = get_task_by_id(conn, payload.task_id)
         if payload.sequence is not None:
             existing = conn.execute(
@@ -2634,7 +2667,9 @@ def receive_v1_device_telemetry(
             move_status=payload.move_status,
             temp_status=telemetry_temp_status(payload, task),
             acc_total=payload.acc_total if payload.acc_total is not None else 0.0,
-            motion_score=payload.motion_score if payload.motion_score is not None else 0.0,
+            motion_score=(
+                payload.motion_score if payload.motion_score is not None else 0.0
+            ),
             timestamp=payload.captured_at,
         )
         row, error = save_device_data(
@@ -2651,7 +2686,7 @@ def receive_v1_device_telemetry(
             payload.device_id,
             payload.task_id,
             payload.battery,
-            row["timestamp"],
+            now_iso(),
         )
 
     return api_success(
@@ -2686,6 +2721,14 @@ def receive_v1_device_heartbeat(
         )
         if signature_error:
             return signature_error
+        device = conn.execute(
+            "SELECT current_task_id FROM devices WHERE device_id = ?",
+            (payload.device_id,),
+        ).fetchone()
+        if payload.task_id and (
+            not device or device["current_task_id"] != payload.task_id
+        ):
+            return api_error(409, 40920, "device does not match task")
         cursor = conn.execute(
             """
             INSERT INTO device_heartbeat (
@@ -2714,7 +2757,7 @@ def receive_v1_device_heartbeat(
             payload.device_id,
             payload.task_id,
             payload.battery,
-            timestamp,
+            created_at,
         )
 
     return api_success(row_to_dict(row), "heartbeat saved")
@@ -2734,16 +2777,23 @@ def register_v1_device(
 
     timestamp = now_iso()
     with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT * FROM devices WHERE device_id = ?",
+            (payload.device_id,),
+        ).fetchone()
+        if existing and not can_manage_device(user, row_to_dict(existing)):
+            return api_error(409, 40921, "device id already registered")
         conn.execute(
             """
             INSERT INTO devices (
                 device_id, device_name, model, status, current_task_id,
-                battery, last_seen_at, created_at, updated_at, device_secret_hash
+                battery, last_seen_at, created_at, updated_at, device_secret_hash,
+                owner_user_id, organization
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
-                device_name = excluded.device_name,
-                model = excluded.model,
+                device_name = COALESCE(excluded.device_name, devices.device_name),
+                model = COALESCE(excluded.model, devices.model),
                 device_secret_hash = COALESCE(excluded.device_secret_hash, devices.device_secret_hash),
                 updated_at = excluded.updated_at
             """,
@@ -2757,7 +2807,13 @@ def register_v1_device(
                 None,
                 timestamp,
                 timestamp,
-                hash_device_secret(payload.device_secret) if payload.device_secret else None,
+                (
+                    hash_device_secret(payload.device_secret)
+                    if payload.device_secret
+                    else None
+                ),
+                user["user_id"],
+                user["organization"],
             ),
         )
         row = conn.execute(
@@ -2777,6 +2833,8 @@ def register_v1_device(
 @app.get("/api/v1/devices")
 def list_v1_devices(
     authorization: Optional[str] = Header(None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
     init_db()
     user = require_user(authorization)
@@ -2784,10 +2842,21 @@ def list_v1_devices(
         return api_error(401, 40102, "unauthorized")
 
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM devices ORDER BY updated_at DESC"
-        ).fetchall()
-    return api_success({"items": [serialize_device(row) for row in rows]})
+        rows = conn.execute("SELECT * FROM devices ORDER BY updated_at DESC").fetchall()
+        items = [
+            serialize_device(row)
+            for row in rows
+            if can_view_device(conn, user, row_to_dict(row))
+        ]
+    start = (page - 1) * page_size
+    return api_success(
+        {
+            "items": items[start : start + page_size],
+            "page": page,
+            "page_size": page_size,
+            "total": len(items),
+        }
+    )
 
 
 @app.post("/api/v1/devices/{device_id}/bind")
@@ -2815,30 +2884,42 @@ def bind_v1_device(
             (device_id,),
         ).fetchone()
         if not device:
+            return api_error(404, 40402, "device not found")
+        device_data = row_to_dict(device)
+        if not can_manage_device(user, device_data):
+            return api_error(404, 40402, "device not found")
+        if (
+            device_data.get("current_task_id")
+            and device_data["current_task_id"] != payload.task_id
+        ):
+            return api_error(409, 40920, "device already bound")
+
+        old_device_id = task.get("device_id")
+        if old_device_id and old_device_id != device_id:
             conn.execute(
                 """
-                INSERT INTO devices (
-                    device_id, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?)
+                UPDATE device_bindings
+                SET status = ?, unbound_at = ?
+                WHERE device_id = ? AND task_id = ? AND status = ?
                 """,
-                (device_id, "available", timestamp, timestamp),
+                ("unbound", timestamp, old_device_id, payload.task_id, "bound"),
             )
-        else:
-            device_data = row_to_dict(device)
-            if (
-                device_data.get("current_task_id")
-                and device_data["current_task_id"] != payload.task_id
-            ):
-                return api_error(409, 40920, "device already bound")
+            conn.execute(
+                """
+                UPDATE devices
+                SET status = ?, current_task_id = NULL, updated_at = ?
+                WHERE device_id = ? AND current_task_id = ?
+                """,
+                ("available", timestamp, old_device_id, payload.task_id),
+            )
 
         conn.execute(
             """
             UPDATE device_bindings
             SET status = ?, unbound_at = ?
-            WHERE device_id = ? AND status = ?
+            WHERE (device_id = ? OR task_id = ?) AND status = ?
             """,
-            ("unbound", timestamp, device_id, "bound"),
+            ("unbound", timestamp, device_id, payload.task_id, "bound"),
         )
         cursor = conn.execute(
             """
@@ -2900,6 +2981,14 @@ def unbind_v1_device(
         ).fetchone()
         if not device:
             return api_error(404, 40402, "device not found")
+        device_data = row_to_dict(device)
+        if not can_manage_device(user, device_data):
+            return api_error(404, 40402, "device not found")
+        task_id = device_data.get("current_task_id")
+        if task_id:
+            task_row = get_task_by_id(conn, task_id)
+            if task_row and not can_modify_task(user, serialize_task(task_row)):
+                return api_error(404, 40402, "device not found")
         conn.execute(
             """
             UPDATE device_bindings
@@ -2916,6 +3005,15 @@ def unbind_v1_device(
             """,
             ("available", timestamp, device_id),
         )
+        if task_id:
+            conn.execute(
+                """
+                UPDATE task_handoff
+                SET device_id = NULL, updated_at = ?
+                WHERE task_id = ? AND device_id = ?
+                """,
+                (timestamp, task_id, device_id),
+            )
         row = conn.execute(
             "SELECT * FROM devices WHERE device_id = ?",
             (device_id,),
@@ -2940,6 +3038,12 @@ def get_v1_device_bindings(
     if not user:
         return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
+        device = conn.execute(
+            "SELECT * FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if not device or not can_view_device(conn, user, row_to_dict(device)):
+            return api_error(404, 40402, "device not found")
         rows = conn.execute(
             """
             SELECT * FROM device_bindings
@@ -2951,197 +3055,49 @@ def get_v1_device_bindings(
     return api_success({"items": [serialize_binding(row) for row in rows]})
 
 
-@app.post("/api/v1/devices/{device_id}/bind-check")
-def check_v1_device_binding(
+@app.post("/api/v1/devices/{device_id}/rotate-secret")
+def rotate_v1_device_secret(
     device_id: str,
-    payload: DeviceBindCheckIn,
-    authorization: Optional[str] = Header(None),
-):
-    init_db()
-    if not require_user(authorization):
-        return api_error(401, 40102, "unauthorized")
-    with get_connection() as conn:
-        device = conn.execute(
-            "SELECT * FROM devices WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()
-    occupied_task_id = device["current_task_id"] if device else None
-    available = not occupied_task_id
-    return api_success(
-        {
-            "device_id": device_id,
-            "box_id": payload.box_id,
-            "seal_id": payload.seal_id,
-            "available": available,
-            "occupied_task_id": occupied_task_id,
-            "checked_at": now_iso(),
-            "message": "设备可绑定" if available else "设备已绑定其他运单",
-        }
-    )
-
-
-@app.get("/api/v1/devices/{device_id}/precheck")
-def precheck_v1_device(
-    device_id: str,
-    min_temp: float = Query(...),
-    max_temp: float = Query(...),
-    allow_local: bool = Query(False),
-    authorization: Optional[str] = Header(None),
-):
-    init_db()
-    if not require_user(authorization):
-        return api_error(401, 40102, "unauthorized")
-    hardware_telemetry = None
-    hardware_error = None
-    available_device_ids: list[str] = []
-    try:
-        snapshot = fetch_live_hardware_snapshot()
-        available_device_ids = sorted(
-            {
-                str(item.get("device_id"))
-                for item in (snapshot.get("latest_telemetry_by_task") or {}).values()
-                if item.get("device_id")
-            }
-        )
-        hardware_telemetry = next(
-            (
-                item
-                for item in (snapshot.get("latest_telemetry_by_task") or {}).values()
-                if str(item.get("device_id") or "") == str(device_id)
-            ),
-            None,
-        )
-    except RuntimeError as exc:
-        hardware_error = str(exc)
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM device_data WHERE device_id = ? ORDER BY id DESC LIMIT 1",
-            (device_id,),
-        ).fetchone()
-    selected_local_row = row if allow_local else None
-    if not hardware_telemetry and not selected_local_row:
-        return api_success(
-            {
-                "device_id": device_id,
-                "online": False,
-                "passed": False,
-                "temperature": None,
-                "humidity": None,
-                "box_status": None,
-                "move_status": None,
-                "reported_at": None,
-                "source": "none",
-                "available_device_ids": available_device_ids,
-                "suggested_device_id": (
-                    available_device_ids[0] if len(available_device_ids) == 1 else None
-                ),
-                "reason": (
-                    "真实硬件接口暂不可用，真实预检不会使用本地测试数据"
-                    if hardware_error
-                    else "真实硬件接口在线，但没有与该设备编号匹配的监测数据"
-                ),
-            }
-        )
-    telemetry = normalize_telemetry(hardware_telemetry or selected_local_row)
-    source = "hardware" if hardware_telemetry else "local"
-    reported_at = telemetry.get("timestamp") or telemetry.get("created_at")
-    age_seconds = None
-    try:
-        reported_time = datetime.fromisoformat(str(reported_at).replace("Z", "+00:00"))
-        if reported_time.tzinfo is None:
-            reported_time = reported_time.replace(tzinfo=timezone.utc)
-        age_seconds = max(
-            0,
-            int(
-                (
-                    datetime.now(timezone.utc)
-                    - reported_time.astimezone(timezone.utc)
-                ).total_seconds()
-            ),
-        )
-    except (TypeError, ValueError):
-        pass
-    fresh = (
-        age_seconds is not None
-        and age_seconds <= PRECHECK_MAX_DATA_AGE_SECONDS
-    )
-    passed = (
-        fresh
-        and min_temp <= telemetry["temperature"] <= max_temp
-        and telemetry["box_status"] == "BOX_CLOSED"
-    )
-    if not fresh:
-        reason = (
-            f"{'真实硬件' if source == 'hardware' else '本地后端'}数据已过期"
-            + (f"（{age_seconds} 秒前）" if age_seconds is not None else "（时间无效）")
-            + "，不能作为当前预检结果"
-        )
-    elif passed:
-        reason = f"{'真实硬件' if source == 'hardware' else '本地后端'}数据：温度与箱体状态合格"
-    else:
-        reason = f"{'真实硬件' if source == 'hardware' else '本地后端'}数据：请检查温度范围与箱体封闭状态"
-    return api_success(
-        {
-            "device_id": device_id,
-            "online": fresh,
-            "passed": passed,
-            "temperature": telemetry["temperature"],
-            "humidity": telemetry["humidity"],
-            "box_status": telemetry["box_status"],
-            "move_status": telemetry["move_status"],
-            "reported_at": reported_at,
-            "source": source,
-            "fresh": fresh,
-            "age_seconds": age_seconds,
-            "available_device_ids": available_device_ids,
-            "suggested_device_id": None,
-            "reason": reason,
-        }
-    )
-
-
-@app.post("/api/v1/devices/{device_id}/simulate-reading")
-def simulate_v1_device_reading(
-    device_id: str,
-    payload: LocalDeviceReadingIn,
     authorization: Optional[str] = Header(None),
 ):
     init_db()
     user = require_user(authorization)
     if not user:
         return api_error(401, 40102, "unauthorized")
-    if os.environ.get("ALLOW_LOCAL_SIMULATION", "1") != "1":
-        return api_error(403, 40301, "local simulation disabled")
+    timestamp = now_iso()
+    new_secret = secrets.token_urlsafe(32)
     with get_connection() as conn:
-        device_row = conn.execute(
-            "SELECT current_task_id FROM devices WHERE device_id = ?",
+        row = conn.execute(
+            "SELECT * FROM devices WHERE device_id = ?",
             (device_id,),
         ).fetchone()
-        target_task_id = payload.task_id or (
-            device_row["current_task_id"] if device_row else None
+        if not row or not can_manage_device(user, row_to_dict(row)):
+            return api_error(404, 40402, "device not found")
+        conn.execute(
+            """
+            UPDATE devices
+            SET device_secret_hash = ?, updated_at = ?
+            WHERE device_id = ?
+            """,
+            (hash_device_secret(new_secret), timestamp, device_id),
         )
-        if target_task_id:
-            task_row = get_task_by_id(conn, target_task_id)
-            if not task_row or not can_view_task(user, serialize_task(task_row)):
-                return api_error(404, 40401, "task not found")
-            if task_row["device_id"] and str(task_row["device_id"]) != str(device_id):
-                return api_error(409, 40921, "device does not match task")
-        else:
-            target_task_id = f"LOCAL-PRECHECK-{user['user_id']}"
-        data = DeviceDataIn(
-            device_id=device_id,
-            task_id=target_task_id,
-            temperature=payload.temperature,
-            humidity=payload.humidity,
-            light_raw=120,
-            box_status="BOX_CLOSED",
-            move_status="STABLE",
-            temp_status="TEMP_OK",
-            acc_total=1.0,
-            motion_score=0.0,
+        conn.execute("DELETE FROM device_nonces WHERE device_id = ?", (device_id,))
+        record_audit(
+            conn,
+            "device.rotate_secret",
+            user_id=user["user_id"],
+            resource_type="device",
+            resource_id=device_id,
         )
-        row, _ = save_device_data(conn, data)
-    return api_success(normalize_telemetry(row), "local reading created")
+    return api_success(
+        {
+            "device_id": device_id,
+            "device_secret": new_secret,
+            "delivered_once": True,
+            "rotated_at": timestamp,
+        },
+        "device secret rotated",
+    )
 
 
 @app.get("/api/v1/tasks")
@@ -3211,6 +3167,8 @@ def create_v1_task(
         return api_error(401, 40102, "unauthorized")
     if user["role"] not in {"sender", "admin"}:
         return api_error(403, 40301, "forbidden")
+    if payload.device_id is not None:
+        return api_error(422, 42206, "bind devices through the device binding endpoint")
 
     timestamp = now_iso()
     with get_connection() as conn:
@@ -3227,42 +3185,19 @@ def create_v1_task(
 
         task_id = generate_task_id(conn)
         sender = user["organization"] or user["display_name"]
-        carrier_user = None
-        receiver_user = None
-        if payload.carrier:
-            carrier_user = conn.execute(
-                """
-                SELECT * FROM users
-                WHERE role = 'carrier' AND status = 'active'
-                  AND (username = ? OR phone = ? OR name = ? OR display_name = ?)
-                ORDER BY id DESC LIMIT 1
-                """,
-                (payload.carrier, payload.carrier, payload.carrier, payload.carrier),
-            ).fetchone()
-        if payload.receiver:
-            receiver_user = conn.execute(
-                """
-                SELECT * FROM users
-                WHERE role = 'receiver' AND status = 'active'
-                  AND (username = ? OR phone = ? OR name = ? OR display_name = ?)
-                ORDER BY id DESC LIMIT 1
-                """,
-                (payload.receiver, payload.receiver, payload.receiver, payload.receiver),
-            ).fetchone()
         cursor = conn.execute(
             """
             INSERT INTO task_handoff (
                 task_id, device_id, sample_name, sender, receiver, carrier,
                 status, started_at, signed_at, updated_at,
-                owner_user_id, carrier_user_id, receiver_user_id,
-                batch, expected_arrival, box_id, seal_id,
+                owner_user_id, batch, expected_arrival, box_id, seal_id,
                 temperature_min, temperature_max, idempotency_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
-                payload.device_id,
+                None,
                 payload.sample_name,
                 sender,
                 payload.receiver or "",
@@ -3272,8 +3207,6 @@ def create_v1_task(
                 None,
                 timestamp,
                 user["user_id"],
-                carrier_user["id"] if carrier_user else None,
-                receiver_user["id"] if receiver_user else None,
                 payload.batch,
                 payload.expected_arrival,
                 payload.box_id,
@@ -3311,6 +3244,8 @@ def create_v1_task(
 def get_v1_task(task_id: str, authorization: Optional[str] = Header(None)):
     init_db()
     user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
         row = get_task_by_id(conn, task_id)
         if row and not can_view_task(user, serialize_task(row)):
@@ -3321,7 +3256,6 @@ def get_v1_task(task_id: str, authorization: Optional[str] = Header(None)):
 
 
 @app.patch("/api/v1/tasks/{task_id}")
-@app.put("/api/v1/tasks/{task_id}")
 def update_v1_task(
     task_id: str,
     payload: UpdateTaskIn,
@@ -3341,56 +3275,26 @@ def update_v1_task(
             return api_error(404, 40401, "task not found")
         if task["status"] not in {"pending_pack", "pending_handoff"}:
             return task_state_conflict()
-
+        if "device_id" in payload.model_fields_set:
+            return api_error(
+                422, 42206, "bind devices through the device binding endpoint"
+            )
         allowed = {
             "sample_name",
             "batch",
             "receiver",
             "carrier",
             "expected_arrival",
-            "device_id",
             "box_id",
             "seal_id",
             "temperature_min",
             "temperature_max",
         }
         changes = payload.model_dump(exclude_unset=True)
-        if "carrier" in changes:
-            carrier_user = conn.execute(
-                """
-                SELECT id FROM users
-                WHERE role = 'carrier' AND status = 'active'
-                  AND (username = ? OR phone = ? OR name = ? OR display_name = ?)
-                ORDER BY id DESC LIMIT 1
-                """,
-                (
-                    changes["carrier"],
-                    changes["carrier"],
-                    changes["carrier"],
-                    changes["carrier"],
-                ),
-            ).fetchone()
-            changes["carrier_user_id"] = carrier_user["id"] if carrier_user else None
-        if "receiver" in changes:
-            receiver_user = conn.execute(
-                """
-                SELECT id FROM users
-                WHERE role = 'receiver' AND status = 'active'
-                  AND (username = ? OR phone = ? OR name = ? OR display_name = ?)
-                ORDER BY id DESC LIMIT 1
-                """,
-                (
-                    changes["receiver"],
-                    changes["receiver"],
-                    changes["receiver"],
-                    changes["receiver"],
-                ),
-            ).fetchone()
-            changes["receiver_user_id"] = receiver_user["id"] if receiver_user else None
         assignments = []
         values = []
         for key, value in changes.items():
-            if key in allowed or key in {"carrier_user_id", "receiver_user_id"}:
+            if key in allowed:
                 assignments.append(f"{key} = ?")
                 values.append(value)
         if assignments:
@@ -3401,18 +3305,8 @@ def update_v1_task(
                 f"UPDATE task_handoff SET {', '.join(assignments)} WHERE task_id = ?",
                 values,
             )
-            record_audit(
-                conn,
-                "task.update",
-                user_id=user["user_id"],
-                resource_type="task",
-                resource_id=task_id,
-                task_id=task_id,
-                detail=",".join(changes.keys()),
-            )
         updated = get_task_by_id(conn, task_id)
-        result = enrich_task(updated, conn)
-    return api_success(result, "task updated")
+    return api_success(enrich_task(updated, conn), "task updated")
 
 
 @app.post("/api/v1/tasks/{task_id}/assign")
@@ -3433,8 +3327,30 @@ def assign_v1_task(
         task = serialize_task(row)
         if not can_modify_task(user, task):
             return api_error(404, 40401, "task not found")
-        if task["status"] not in {"pending_pack", "pending_handoff"}:
+        receiver_recovery = (
+            task["status"] in {"in_transit", "arrived"}
+            and not task.get("receiver_user_id")
+            and payload.receiver_user_id is not None
+            and payload.carrier_user_id == task.get("carrier_user_id")
+        )
+        if task["status"] not in {"pending_pack", "pending_handoff"} and not receiver_recovery:
             return task_state_conflict()
+        if payload.carrier_user_id is not None:
+            carrier = get_user_row(conn, payload.carrier_user_id)
+            if (
+                not carrier
+                or carrier["role"] != "carrier"
+                or (carrier["status"] or "active") != "active"
+            ):
+                return api_error(422, 42207, "invalid carrier")
+        if payload.receiver_user_id is not None:
+            receiver = get_user_row(conn, payload.receiver_user_id)
+            if (
+                not receiver
+                or receiver["role"] != "receiver"
+                or (receiver["status"] or "active") != "active"
+            ):
+                return api_error(422, 42208, "invalid receiver")
 
         conn.execute(
             """
@@ -3447,6 +3363,19 @@ def assign_v1_task(
                 payload.receiver_user_id,
                 now_iso(),
                 task_id,
+            ),
+        )
+        record_audit(
+            conn,
+            "task.assign_receiver_recovery" if receiver_recovery else "task.assign",
+            user_id=user["user_id"],
+            resource_type="task",
+            resource_id=task_id,
+            task_id=task_id,
+            detail=(
+                f"receiver_user_id={payload.receiver_user_id}"
+                if receiver_recovery
+                else None
             ),
         )
         updated = get_task_by_id(conn, task_id)
@@ -3472,7 +3401,13 @@ def cancel_v1_task(
         task = serialize_task(row)
         if not can_modify_task(user, task):
             return api_error(404, 40401, "task not found")
-        if task["status"] in {"in_transit", "arrived", "signed", "rejected", "canceled"}:
+        if task["status"] in {
+            "in_transit",
+            "arrived",
+            "signed",
+            "rejected",
+            "canceled",
+        }:
             return task_state_conflict()
         conn.execute(
             """
@@ -3575,8 +3510,30 @@ def create_v1_handoff(
         if not can_view_task(user, task):
             return api_error(404, 40401, "task not found")
         to_user = get_user_row(conn, payload.to_user_id)
-        if not to_user:
+        if not to_user or (to_user["status"] or "active") != "active":
             return api_error(404, 40404, "target user not found")
+        if payload.handoff_type == "sender_to_carrier":
+            if (
+                not can_modify_task(user, task)
+                or task.get("carrier_user_id") != payload.to_user_id
+                or to_user["role"] != "carrier"
+            ):
+                return api_error(403, 40301, "forbidden")
+        elif payload.handoff_type == "carrier_to_receiver":
+            if (
+                user["role"] != "admin"
+                and task.get("carrier_user_id") != user["user_id"]
+            ):
+                return api_error(403, 40301, "forbidden")
+            if (
+                task.get("receiver_user_id") != payload.to_user_id
+                or to_user["role"] != "receiver"
+            ):
+                return api_error(422, 42209, "invalid handoff target")
+        elif user["role"] != "admin" and task.get("carrier_user_id") != user["user_id"]:
+            return api_error(403, 40301, "forbidden")
+        if payload.to_user_id == user["user_id"]:
+            return api_error(422, 42209, "invalid handoff target")
         existing = conn.execute(
             """
             SELECT * FROM handoffs
@@ -3585,11 +3542,6 @@ def create_v1_handoff(
             (task_id, "pending"),
         ).fetchone()
         if existing:
-            if (
-                existing["from_user_id"] == user["user_id"]
-                and existing["to_user_id"] == payload.to_user_id
-            ):
-                return api_success(serialize_handoff(existing), "handoff reused")
             return api_error(409, 40930, "handoff already pending")
 
         handoff_id = generate_handoff_id()
@@ -3660,6 +3612,11 @@ def create_v1_qr_token(
         ).fetchone()
         if not handoff:
             return api_error(404, 40405, "handoff not found")
+        handoff_data = serialize_handoff(handoff)
+        if handoff_data["status"] != "pending":
+            return api_error(409, 40931, "handoff state conflict")
+        if handoff_data["from_user_id"] != user["user_id"] and user["role"] != "admin":
+            return api_error(403, 40301, "forbidden")
 
         cursor = conn.execute(
             """
@@ -3696,17 +3653,18 @@ def create_v1_qr_token(
             task_id=task_id,
         )
 
-    qr_payload = f"coldchain://handoff?token={token}"
     return api_success(
         {
             "token_id": row["id"],
+            "handoff_id": row["handoff_id"],
             "token": token,
             "expires_at": row["expires_at"],
             "ttl_seconds": payload.ttl_seconds,
             "refresh_after": min(45, max(1, payload.ttl_seconds - 15)),
-            "qr_payload": qr_payload,
-            "qr_image_data_url": qr_image_data_url(qr_payload),
-            "handoff_id": payload.handoff_id,
+            "qr_payload": f"coldchain://handoff?token={token}",
+            "qr_image_data_url": qr_image_data_url(
+                f"coldchain://handoff?token={token}"
+            ),
         },
         "qr token created",
     )
@@ -3725,6 +3683,14 @@ def verify_v1_qr_token(
     timestamp = now_iso()
     token_hash = hash_qr_token(payload.token)
     with get_connection() as conn:
+        rate_error = check_rate_limit(
+            conn,
+            "qr.verify",
+            str(user["user_id"]),
+            VERIFY_RATE_LIMIT,
+        )
+        if rate_error:
+            return rate_error
         row = conn.execute(
             "SELECT * FROM qr_tokens WHERE token_hash = ?",
             (token_hash,),
@@ -3732,8 +3698,35 @@ def verify_v1_qr_token(
         if not row:
             return api_error(410, 41010, "qr token invalid")
         qr = serialize_qr_token(row)
+        handoff = conn.execute(
+            "SELECT * FROM handoffs WHERE handoff_id = ?",
+            (qr["handoff_id"],),
+        ).fetchone()
+        if (
+            not handoff
+            or handoff["status"] != "pending"
+            or (handoff["to_user_id"] != user["user_id"] and user["role"] != "admin")
+        ):
+            return api_error(403, 40301, "forbidden")
         now_dt = datetime.now(timezone.utc).astimezone()
         expires_at = datetime.fromisoformat(qr["expires_at"])
+        if (
+            qr["status"] == "consumed"
+            and qr.get("consumed_at")
+            and qr.get("verified_by_user_id") == user["user_id"]
+            and not qr.get("revoked_at")
+        ):
+            return api_success(
+                {
+                    "valid": True,
+                    "idempotent": True,
+                    "token_id": qr["id"],
+                    "task_id": qr["task_id"],
+                    "handoff_id": qr["handoff_id"],
+                    "action": qr["action"],
+                },
+                "qr token already verified by current recipient",
+            )
         if (
             qr["status"] != "active"
             or qr.get("consumed_at")
@@ -3745,10 +3738,10 @@ def verify_v1_qr_token(
         conn.execute(
             """
             UPDATE qr_tokens
-            SET status = ?, consumed_at = ?
+            SET status = ?, consumed_at = ?, verified_by_user_id = ?
             WHERE id = ?
             """,
-            ("consumed", timestamp, qr["id"]),
+            ("consumed", timestamp, user["user_id"], qr["id"]),
         )
         record_audit(
             conn,
@@ -3919,49 +3912,23 @@ def verify_v1_face(
         return api_error(401, 40102, "unauthorized")
     timestamp = now_iso()
     threshold = 0.8
-    face_count = 0
-    quality_score = payload.similarity_score
-    liveness_passed = payload.liveness_passed
-    if payload.image_base64:
-        try:
-            detection = detect_face_image(payload.image_base64)
-        except ValueError as exc:
-            return api_error(422, 42205, str(exc))
-        face_count = detection["face_count"]
-        quality_score = detection["quality_score"]
-        liveness_passed = detection["passed"]
-    verified = liveness_passed and quality_score >= threshold
+    verified = payload.liveness_passed and payload.similarity_score >= threshold
     manual_review_required = not verified
     verification_id = generate_verification_id()
     location = payload.location
     with get_connection() as conn:
+        rate_error = check_rate_limit(
+            conn,
+            "face.verify",
+            str(user["user_id"]),
+            VERIFY_RATE_LIMIT,
+        )
+        if rate_error:
+            return rate_error
         profile = conn.execute(
             "SELECT * FROM face_profiles WHERE user_id = ? AND status = ?",
             (user["user_id"], "active"),
         ).fetchone()
-        if not profile and payload.image_base64 and verified:
-            conn.execute(
-                """
-                INSERT INTO face_profiles (
-                    user_id, template_id, consent_at, quality_score,
-                    status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user["user_id"],
-                    f"opencv-local-{user['user_id']}",
-                    timestamp,
-                    quality_score,
-                    "active",
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            profile = conn.execute(
-                "SELECT * FROM face_profiles WHERE user_id = ? AND status = ?",
-                (user["user_id"], "active"),
-            ).fetchone()
         if not profile:
             return api_error(400, 40021, "face profile not enrolled")
         handoff = conn.execute(
@@ -3970,11 +3937,20 @@ def verify_v1_face(
         ).fetchone()
         if not handoff:
             return api_error(404, 40405, "handoff not found")
-        if user["role"] != "admin" and user["user_id"] not in {
-            handoff["from_user_id"],
-            handoff["to_user_id"],
-        }:
+        if handoff["to_user_id"] != user["user_id"] and user["role"] != "admin":
             return api_error(403, 40301, "forbidden")
+        qr_verified = conn.execute(
+            """
+            SELECT id FROM qr_tokens
+            WHERE handoff_id = ? AND status = ? AND consumed_at IS NOT NULL
+              AND verified_by_user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (payload.handoff_id, "consumed", user["user_id"]),
+        ).fetchone()
+        if not qr_verified:
+            return api_error(409, 40932, "verified qr token required")
         conn.execute(
             """
             INSERT INTO face_verifications (
@@ -3990,11 +3966,11 @@ def verify_v1_face(
                 verification_id,
                 user["user_id"],
                 payload.handoff_id,
-                payload.qr_token,
+                None,
                 payload.capture_file_id,
-                payload.liveness_token,
-                int(liveness_passed),
-                quality_score,
+                None,
+                int(payload.liveness_passed),
+                payload.similarity_score,
                 threshold,
                 int(verified),
                 int(manual_review_required),
@@ -4028,73 +4004,7 @@ def verify_v1_face(
             resource_id=verification_id,
             task_id=handoff["task_id"],
         )
-    result = serialize_face_verification(row)
-    result["face_count"] = face_count or (1 if result["verified"] else 0)
-    result["quality_score"] = result["similarity_score"]
-    result["party"] = "issuer" if user["user_id"] == handoff["from_user_id"] else "recipient"
-    return api_success(result, "face verified")
-
-
-@app.post("/api/v1/face/simulate-verify")
-def simulate_v1_face(
-    payload: FaceSimulateIn,
-    authorization: Optional[str] = Header(None),
-):
-    init_db()
-    user = require_user(authorization)
-    if not user:
-        return api_error(401, 40102, "unauthorized")
-    if os.environ.get("ALLOW_LOCAL_SIMULATION", "1") != "1":
-        return api_error(403, 40301, "local simulation disabled")
-    timestamp = now_iso()
-    with get_connection() as conn:
-        handoff = conn.execute(
-            "SELECT * FROM handoffs WHERE handoff_id = ?",
-            (payload.handoff_id,),
-        ).fetchone()
-        if not handoff:
-            return api_error(404, 40405, "handoff not found")
-        if user["role"] != "admin" and user["user_id"] not in {
-            handoff["from_user_id"],
-            handoff["to_user_id"],
-        }:
-            return api_error(403, 40301, "forbidden")
-        verification_id = generate_verification_id()
-        conn.execute(
-            """
-            INSERT INTO face_verifications (
-                verification_id, user_id, handoff_id, liveness_passed,
-                similarity_score, threshold, verified, manual_review_required,
-                status, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                verification_id,
-                user["user_id"],
-                payload.handoff_id,
-                1,
-                0.99,
-                0.8,
-                1,
-                0,
-                "verified",
-                timestamp,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM face_verifications WHERE verification_id = ?",
-            (verification_id,),
-        ).fetchone()
-    result = serialize_face_verification(row)
-    result.update(
-        {
-            "face_count": 1,
-            "quality_score": result["similarity_score"],
-            "party": "issuer" if user["user_id"] == handoff["from_user_id"] else "recipient",
-        }
-    )
-    return api_success(result, "local face simulation verified")
+    return api_success(serialize_face_verification(row), "face verified")
 
 
 @app.get("/api/v1/admin/face-reviews")
@@ -4117,7 +4027,9 @@ def list_v1_admin_face_reviews(
             """,
             (limit,),
         ).fetchall()
-    return api_success({"limit": limit, "items": [serialize_face_review(row) for row in rows]})
+    return api_success(
+        {"limit": limit, "items": [serialize_face_review(row) for row in rows]}
+    )
 
 
 @app.post("/api/v1/admin/face-reviews/{review_id}/approve")
@@ -4218,6 +4130,124 @@ def reject_v1_admin_face_review(
     return api_success(serialize_face_review(updated), "face review rejected")
 
 
+@app.post("/api/v1/files/upload")
+async def upload_v1_file(
+    task_id: str = Form(...),
+    usage: str = Form(...),
+    related_type: Optional[str] = Form(default=None),
+    related_id: Optional[str] = Form(default=None),
+    expected_sha256: Optional[str] = Form(default=None),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    content_type = (file.content_type or "").lower()
+    allowed_extensions = ALLOWED_EVIDENCE_TYPES.get(content_type)
+    original_name = Path(file.filename or "evidence").name
+    extension = Path(original_name).suffix.lower()
+    if not allowed_extensions or extension not in allowed_extensions:
+        return api_error(415, 41501, "unsupported evidence file type")
+    content = await file.read(MAX_EVIDENCE_FILE_SIZE + 1)
+    await file.close()
+    if len(content) > MAX_EVIDENCE_FILE_SIZE:
+        return api_error(413, 41301, "evidence file too large")
+    if not content or not valid_file_signature(content_type, content):
+        return api_error(415, 41502, "invalid evidence file content")
+    digest = hashlib.sha256(content).hexdigest()
+    if expected_sha256 and not secrets.compare_digest(
+        digest,
+        expected_sha256.strip().lower(),
+    ):
+        return api_error(409, 40950, "file sha256 mismatch")
+    usage = usage.strip()
+    if not usage or len(usage) > 80:
+        return api_error(422, 42210, "invalid file usage")
+
+    timestamp = now_iso()
+    with get_connection() as conn:
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
+            return api_error(404, 40401, "task not found")
+        if related_type == "handoff":
+            handoff = conn.execute(
+                """
+                SELECT id FROM handoffs
+                WHERE handoff_id = ? AND task_id = ?
+                """,
+                (related_id, task_id),
+            ).fetchone()
+            if not handoff:
+                return api_error(404, 40405, "handoff not found")
+        duplicate = conn.execute(
+            """
+            SELECT * FROM files
+            WHERE task_id = ? AND sha256 = ? AND usage = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (task_id, digest, usage),
+        ).fetchone()
+        if duplicate:
+            item = serialize_file(duplicate)
+            item["download_url"] = f"/api/v1/files/{item['file_id']}/download"
+            return api_success(item, "file already exists")
+
+        file_id = generate_file_id()
+        FILE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{file_id}{extension}"
+        storage_path = FILE_STORAGE_DIR / stored_name
+        try:
+            storage_path.write_bytes(content)
+            cursor = conn.execute(
+                """
+                INSERT INTO files (
+                    file_id, task_id, file_name, file_type, file_size,
+                    sha256, usage, related_type, related_id, storage_url,
+                    uploader_user_id, created_at, storage_path
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    task_id,
+                    original_name,
+                    content_type,
+                    len(content),
+                    digest,
+                    usage,
+                    related_type,
+                    related_id,
+                    None,
+                    user["user_id"],
+                    timestamp,
+                    str(storage_path),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM files WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            record_audit(
+                conn,
+                "file.upload",
+                user_id=user["user_id"],
+                resource_type="file",
+                resource_id=file_id,
+                task_id=task_id,
+                detail=usage,
+            )
+        except Exception:
+            storage_path.unlink(missing_ok=True)
+            raise
+
+    item = serialize_file(row)
+    item["download_url"] = f"/api/v1/files/{file_id}/download"
+    return api_success(item, "file uploaded")
+
+
 @app.post("/api/v1/files")
 def create_v1_file(
     payload: CreateFileIn,
@@ -4298,9 +4328,87 @@ def get_v1_file(
         if not task_row or not can_view_task(user, serialize_task(task_row)):
             return api_error(404, 40407, "file not found")
 
-    item["download_url"] = item["storage_url"] or f"local://files/{file_id}"
+    item["download_url"] = item["storage_url"] or f"/api/v1/files/{file_id}/download"
     item["expires_in"] = 300
     return api_success(item)
+
+
+@app.get("/api/v1/files/{file_id}/download")
+def download_v1_file(
+    file_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM files WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()
+        if not row:
+            return api_error(404, 40407, "file not found")
+        raw = row_to_dict(row)
+        task = get_task_by_id(conn, raw["task_id"])
+        if not task or not can_view_task(user, serialize_task(task)):
+            return api_error(404, 40407, "file not found")
+        storage_path_value = raw.get("storage_path")
+        if not storage_path_value:
+            return api_error(404, 40410, "file content not stored")
+        storage_path = Path(storage_path_value).resolve()
+        storage_root = FILE_STORAGE_DIR.resolve()
+        if storage_root not in storage_path.parents or not storage_path.is_file():
+            return api_error(404, 40410, "file content not stored")
+        record_audit(
+            conn,
+            "file.download",
+            user_id=user["user_id"],
+            resource_type="file",
+            resource_id=file_id,
+            task_id=raw["task_id"],
+        )
+        file_name = raw["file_name"]
+        media_type = raw["file_type"]
+    return FileResponse(
+        path=storage_path,
+        media_type=media_type,
+        filename=file_name,
+    )
+
+
+@app.get("/api/v1/tasks/{task_id}/handoffs")
+def list_v1_task_handoffs(
+    task_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    with get_connection() as conn:
+        task = get_task_by_id(conn, task_id)
+        if not task or not can_view_task(user, serialize_task(task)):
+            return api_error(404, 40401, "task not found")
+        total = conn.execute(
+            "SELECT COUNT(*) AS count FROM handoffs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()["count"]
+        rows = conn.execute(
+            """
+            SELECT * FROM handoffs
+            WHERE task_id = ?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (task_id, page_size, (page - 1) * page_size),
+        ).fetchall()
+        items = [serialize_handoff_detail(conn, row) for row in rows]
+    return api_success(
+        {"items": items, "page": page, "page_size": page_size, "total": total}
+    )
 
 
 @app.get("/api/v1/handoffs/{handoff_id}")
@@ -4324,8 +4432,8 @@ def get_v1_handoff(
         task_row = get_task_by_id(conn, handoff["task_id"])
         if not task_row or not can_view_task(user, serialize_task(task_row)):
             return api_error(404, 40405, "handoff not found")
-        result = enrich_handoff(conn, row)
-    return api_success(result)
+        detail = serialize_handoff_detail(conn, row)
+    return api_success(detail)
 
 
 @app.post("/api/v1/handoffs/{handoff_id}/confirm")
@@ -4352,32 +4460,27 @@ def confirm_v1_handoff(
             return api_error(409, 40931, "handoff state conflict")
         if handoff["to_user_id"] != user["user_id"] and user["role"] != "admin":
             return api_error(403, 40301, "forbidden")
-        task_row = get_task_by_id(conn, handoff["task_id"])
-        previous_status = canonical_task_status(row_to_dict(task_row)) if task_row else None
-        qr_verified = conn.execute(
+        qr_evidence = conn.execute(
             """
-            SELECT 1 FROM qr_tokens
-            WHERE handoff_id = ? AND consumed_at IS NOT NULL
-            ORDER BY id DESC LIMIT 1
+            SELECT * FROM qr_tokens
+            WHERE handoff_id = ? AND status = ? AND consumed_at IS NOT NULL
+              AND verified_by_user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
             """,
-            (handoff_id,),
+            (handoff_id, "consumed", handoff["to_user_id"]),
         ).fetchone()
-        verified_users = {
-            face["user_id"]
-            for face in conn.execute(
-                """
-                SELECT user_id FROM face_verifications
-                WHERE handoff_id = ? AND verified = 1
-                """,
-                (handoff_id,),
-            ).fetchall()
-        }
-        if not qr_verified:
-            return api_error(409, 40932, "handoff qr not verified")
-        if handoff["from_user_id"] not in verified_users:
-            return api_error(409, 40933, "issuer face not verified")
-        if handoff["to_user_id"] not in verified_users:
-            return api_error(409, 40934, "recipient face not verified")
+        if not qr_evidence:
+            return api_error(409, 40932, "verified qr token required")
+        task_row = get_task_by_id(conn, handoff["task_id"])
+        previous_status = (
+            canonical_task_status(row_to_dict(task_row)) if task_row else None
+        )
+        next_task_status = (
+            "arrived"
+            if handoff["handoff_type"] == "carrier_to_receiver"
+            else "in_transit"
+        )
 
         certificate_no = f"HO-CERT-{handoff['id']:06d}"
         trace_hash = build_trace_hash(
@@ -4393,7 +4496,7 @@ def confirm_v1_handoff(
             UPDATE handoffs
             SET status = ?, location_lat = ?, location_lng = ?,
                 location_accuracy = ?, certificate_no = ?, trace_hash = ?,
-                note = ?, confirmed_at = ?, updated_at = ?
+                confirmed_at = ?, updated_at = ?
             WHERE handoff_id = ?
             """,
             (
@@ -4403,7 +4506,6 @@ def confirm_v1_handoff(
                 location.accuracy if location else None,
                 certificate_no,
                 trace_hash,
-                payload.note.strip() if payload.note else None,
                 timestamp,
                 timestamp,
                 handoff_id,
@@ -4413,17 +4515,25 @@ def confirm_v1_handoff(
             """
             UPDATE task_handoff
             SET status = ?, started_at = COALESCE(started_at, ?),
+                arrived_at = CASE WHEN ? = 'arrived' THEN ? ELSE arrived_at END,
                 updated_at = ?
             WHERE task_id = ?
             """,
-            ("in_transit", timestamp, timestamp, handoff["task_id"]),
+            (
+                next_task_status,
+                timestamp,
+                next_task_status,
+                timestamp,
+                timestamp,
+                handoff["task_id"],
+            ),
         )
-        if previous_status != "in_transit":
+        if previous_status != next_task_status:
             record_status_history(
                 conn,
                 task_id=handoff["task_id"],
                 from_status=previous_status,
-                to_status="in_transit",
+                to_status=next_task_status,
                 reason="handoff confirmed",
                 actor_user_id=user["user_id"],
                 changed_at=timestamp,
@@ -4442,7 +4552,7 @@ def confirm_v1_handoff(
         )
 
     result = serialize_handoff(updated)
-    result["task_status"] = "in_transit"
+    result["task_status"] = next_task_status
     result["current_custodian"] = result["to_user_id"]
     result["handoff_certificate_no"] = result["certificate_no"]
     return api_success(result, "handoff confirmed")
@@ -4496,11 +4606,17 @@ def reject_v1_handoff(
 
 
 @app.get("/api/v1/tasks/{task_id}/telemetry/latest")
-def get_v1_latest_telemetry(task_id: str):
+def get_v1_latest_telemetry(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
         task = get_task_by_id(conn, task_id)
-        if not task:
+        if not task or not can_view_task(user, serialize_task(task)):
             return api_error(404, 40401, "task not found")
         row = conn.execute(
             """
@@ -4514,80 +4630,6 @@ def get_v1_latest_telemetry(task_id: str):
     return api_success(normalize_telemetry(row) if row else None)
 
 
-@app.get("/api/v1/tasks/{task_id}/hardware/snapshot")
-def get_v1_task_hardware_snapshot(
-    task_id: str,
-    authorization: Optional[str] = Header(None),
-):
-    """代理真实硬件快照，并且只返回与当前任务或绑定设备严格匹配的数据。"""
-    init_db()
-    user = require_user(authorization)
-    if not user:
-        return api_error(401, 40102, "unauthorized")
-    with get_connection() as conn:
-        task_row = get_task_by_id(conn, task_id)
-        if not task_row:
-            return api_error(404, 40401, "task not found")
-        task = serialize_task(task_row)
-        if not can_view_task(user, task):
-            return api_error(404, 40401, "task not found")
-
-    try:
-        snapshot = fetch_live_hardware_snapshot()
-    except RuntimeError as exc:
-        return api_error(502, 50201, str(exc))
-
-    requested_device_id = str(task.get("device_id") or "")
-    latest_by_task = snapshot.get("latest_telemetry_by_task") or {}
-    latest = latest_by_task.get(task_id)
-    matched_by: Optional[str] = "task_id" if latest else None
-
-    if not latest and requested_device_id:
-        latest = next(
-            (
-                item
-                for item in latest_by_task.values()
-                if str(item.get("device_id") or "") == requested_device_id
-            ),
-            None,
-        )
-        if latest:
-            matched_by = "device_id"
-
-    history_by_task = snapshot.get("telemetry_history_by_task") or {}
-    history = history_by_task.get(task_id) or []
-    if not history and requested_device_id:
-        history = [
-            item
-            for items in history_by_task.values()
-            for item in (items or [])
-            if str(item.get("device_id") or "") == requested_device_id
-        ]
-
-    alarms = [
-        item
-        for item in (snapshot.get("recent_alarms") or [])
-        if str(item.get("task_id") or "") == task_id
-        or (
-            requested_device_id
-            and str(item.get("device_id") or "") == requested_device_id
-        )
-    ]
-    return api_success(
-        {
-            "source_url": LIVE_SNAPSHOT_URL,
-            "generated_at": snapshot.get("generated_at"),
-            "requested_task_id": task_id,
-            "requested_device_id": requested_device_id or None,
-            "matched": bool(latest),
-            "matched_by": matched_by,
-            "latest": normalize_telemetry(latest) if latest else None,
-            "history": [normalize_telemetry(item) for item in history[:60]],
-            "recent_alarms": alarms[:50],
-        }
-    )
-
-
 @app.get("/api/v1/tasks/{task_id}/telemetry/history")
 def get_v1_telemetry_history(
     task_id: str,
@@ -4596,13 +4638,17 @@ def get_v1_telemetry_history(
     end_time: Optional[str] = Query(default=None),
     cursor: Optional[int] = Query(default=None, ge=1),
     downsample: int = Query(default=1, ge=1, le=60),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     start_time = normalize_query_time(start_time)
     end_time = normalize_query_time(end_time)
     with get_connection() as conn:
         task = get_task_by_id(conn, task_id)
-        if not task:
+        if not task or not can_view_task(user, serialize_task(task)):
             return api_error(404, 40401, "task not found")
         conditions = ["task_id = ?"]
         params: list[object] = [task_id]
@@ -4645,11 +4691,15 @@ def get_v1_telemetry_history(
 def get_v1_alarms(
     task_id: str,
     limit: int = Query(default=100, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
         task = get_task_by_id(conn, task_id)
-        if not task:
+        if not task or not can_view_task(user, serialize_task(task)):
             return api_error(404, 40401, "task not found")
         ensure_task_offline_alarm(conn, task)
         rows = conn.execute(
@@ -4667,8 +4717,16 @@ def get_v1_alarms(
 
 
 @app.post("/api/v1/alarms/{alarm_id}/ack")
-def ack_v1_alarm(alarm_id: int):
+def ack_v1_alarm(
+    alarm_id: int,
+    authorization: Optional[str] = Header(None),
+):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if user["role"] != "admin":
+        return api_error(403, 40301, "forbidden")
     timestamp = now_iso()
     with get_connection() as conn:
         row = conn.execute(
@@ -4688,6 +4746,7 @@ def ack_v1_alarm(alarm_id: int):
         record_audit(
             conn,
             "alarm.ack",
+            user_id=user["user_id"],
             resource_type="alarm",
             resource_id=str(alarm_id),
             task_id=row["task_id"],
@@ -4700,8 +4759,17 @@ def ack_v1_alarm(alarm_id: int):
 
 
 @app.post("/api/v1/alarms/{alarm_id}/resolve")
-def resolve_v1_alarm(alarm_id: int, payload: ResolveAlarmIn):
+def resolve_v1_alarm(
+    alarm_id: int,
+    payload: ResolveAlarmIn,
+    authorization: Optional[str] = Header(None),
+):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if user["role"] != "admin":
+        return api_error(403, 40301, "forbidden")
     timestamp = now_iso()
     with get_connection() as conn:
         row = conn.execute(
@@ -4722,6 +4790,7 @@ def resolve_v1_alarm(alarm_id: int, payload: ResolveAlarmIn):
         record_audit(
             conn,
             "alarm.resolve",
+            user_id=user["user_id"],
             resource_type="alarm",
             resource_id=str(alarm_id),
             task_id=row["task_id"],
@@ -4754,7 +4823,9 @@ def list_v1_audit_logs(
             """,
             (limit,),
         ).fetchall()
-    return api_success({"limit": limit, "items": [serialize_audit_log(row) for row in rows]})
+    return api_success(
+        {"limit": limit, "items": [serialize_audit_log(row) for row in rows]}
+    )
 
 
 @app.get("/api/v1/admin/users")
@@ -4816,7 +4887,8 @@ def update_v1_admin_user_status(
 @app.get("/api/v1/admin/tasks")
 def list_v1_admin_tasks(
     authorization: Optional[str] = Header(None),
-    limit: int = Query(default=100, ge=1, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
     init_db()
     user = require_user(authorization)
@@ -4825,12 +4897,100 @@ def list_v1_admin_tasks(
     if user["role"] != "admin":
         return api_error(403, 40301, "forbidden")
     with get_connection() as conn:
+        total = conn.execute("SELECT COUNT(*) AS count FROM task_handoff").fetchone()[
+            "count"
+        ]
         rows = conn.execute(
-            "SELECT * FROM task_handoff ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
+            """
+            SELECT * FROM task_handoff
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (page_size, (page - 1) * page_size),
         ).fetchall()
         items = [enrich_task(row, conn) for row in rows]
-    return api_success({"limit": limit, "items": items})
+    return api_success(
+        {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }
+    )
+
+
+@app.get("/api/v1/dashboard/summary")
+def get_v1_dashboard_summary(
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if user["role"] != "admin":
+        return api_error(403, 40301, "forbidden")
+    scan_offline_devices()
+    today = (
+        datetime.now(timezone.utc)
+        .astimezone()
+        .replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        .isoformat(timespec="seconds")
+    )
+    with get_connection() as conn:
+        task_rows = conn.execute("SELECT * FROM task_handoff").fetchall()
+        task_statuses = [canonical_task_status(row_to_dict(row)) for row in task_rows]
+        status_distribution = {
+            status: task_statuses.count(status) for status in TASK_STATUSES
+        }
+        active_tasks = sum(
+            1 for status in task_statuses if status in {"in_transit", "arrived"}
+        )
+        abnormal_tasks = conn.execute(
+            """
+            SELECT COUNT(DISTINCT task_id) AS count
+            FROM event_log
+            WHERE COALESCE(alarm_status, 'new') != ?
+            """,
+            ("resolved",),
+        ).fetchone()["count"]
+        device_rows = conn.execute("SELECT * FROM devices").fetchall()
+        device_statuses = [serialize_device(row)["status"] for row in device_rows]
+        online_devices = sum(
+            1 for status in device_statuses if status in {"online", "bound"}
+        )
+        offline_devices = device_statuses.count("offline")
+        today_alarm_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM event_log WHERE created_at >= ?",
+            (today,),
+        ).fetchone()["count"]
+        alarm_rows = conn.execute(
+            """
+            SELECT event_type, COUNT(*) AS count
+            FROM event_log
+            WHERE created_at >= ?
+            GROUP BY event_type
+            """,
+            (today,),
+        ).fetchall()
+    return api_success(
+        {
+            "active_tasks": active_tasks,
+            "abnormal_tasks": abnormal_tasks,
+            "online_devices": online_devices,
+            "offline_devices": offline_devices,
+            "today_alarm_count": today_alarm_count,
+            "status_distribution": status_distribution,
+            "alarm_distribution": {
+                row["event_type"]: row["count"] for row in alarm_rows
+            },
+            "updated_at": now_iso(),
+        }
+    )
 
 
 @app.get("/api/v1/notifications")
@@ -4852,7 +5012,9 @@ def list_v1_notifications(
             """,
             (user["user_id"], limit),
         ).fetchall()
-    return api_success({"limit": limit, "items": [serialize_notification(row) for row in rows]})
+    return api_success(
+        {"limit": limit, "items": [serialize_notification(row) for row in rows]}
+    )
 
 
 @app.post("/api/v1/notifications/{notification_id}/read")
@@ -4898,8 +5060,12 @@ def task_state_conflict():
 def start_v1_task(
     task_id: str,
     idempotency_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     timestamp = now_iso()
     with get_connection() as conn:
         scope = f"task:{task_id}:start"
@@ -4909,6 +5075,15 @@ def start_v1_task(
         row = get_task_by_id(conn, task_id)
         if not row:
             return api_error(404, 40401, "task not found")
+        task = serialize_task(row)
+        if not can_modify_task(user, task):
+            return api_error(404, 40401, "task not found")
+        if task_id != DEMO_TASK["task_id"] and (
+            task["status"] != "pending_handoff"
+            or not task.get("carrier_user_id")
+            or not task.get("receiver_user_id")
+        ):
+            return api_error(409, 40902, "task handoff prerequisites incomplete")
         if canonical_task_status(row_to_dict(row)) not in {
             "pending_pack",
             "pending_handoff",
@@ -4931,11 +5106,13 @@ def start_v1_task(
             from_status=previous_status,
             to_status="in_transit",
             reason="task started",
+            actor_user_id=user["user_id"],
             changed_at=timestamp,
         )
         record_audit(
             conn,
             "task.start",
+            user_id=user["user_id"],
             resource_type="task",
             resource_id=task_id,
             task_id=task_id,
@@ -4950,8 +5127,12 @@ def start_v1_task(
 def arrive_v1_task(
     task_id: str,
     idempotency_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     timestamp = now_iso()
     with get_connection() as conn:
         scope = f"task:{task_id}:arrive"
@@ -4960,6 +5141,9 @@ def arrive_v1_task(
             return api_success(existing_result["data"], existing_result["message"])
         row = get_task_by_id(conn, task_id)
         if not row:
+            return api_error(404, 40401, "task not found")
+        task = serialize_task(row)
+        if user["role"] != "admin" and task.get("carrier_user_id") != user["user_id"]:
             return api_error(404, 40401, "task not found")
         previous_status = canonical_task_status(row_to_dict(row))
         if previous_status != "in_transit":
@@ -4978,11 +5162,13 @@ def arrive_v1_task(
             from_status=previous_status,
             to_status="arrived",
             reason="task arrived",
+            actor_user_id=user["user_id"],
             changed_at=timestamp,
         )
         record_audit(
             conn,
             "task.arrive",
+            user_id=user["user_id"],
             resource_type="task",
             resource_id=task_id,
             task_id=task_id,
@@ -4997,8 +5183,12 @@ def arrive_v1_task(
 def sign_v1_task(
     task_id: str,
     idempotency_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     timestamp = now_iso()
     with get_connection() as conn:
         scope = f"task:{task_id}:sign"
@@ -5008,6 +5198,27 @@ def sign_v1_task(
         row = get_task_by_id(conn, task_id)
         if not row:
             return api_error(404, 40401, "task not found")
+        task = serialize_task(row)
+        if user["role"] != "admin" and task.get("receiver_user_id") != user["user_id"]:
+            return api_error(404, 40401, "task not found")
+        if task_id != DEMO_TASK["task_id"]:
+            confirmed_handoff = conn.execute(
+                """
+                SELECT id FROM handoffs
+                WHERE task_id = ? AND handoff_type = ? AND to_user_id = ?
+                  AND status = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    task_id,
+                    "carrier_to_receiver",
+                    task.get("receiver_user_id"),
+                    "confirmed",
+                ),
+            ).fetchone()
+            if not confirmed_handoff:
+                return api_error(409, 40933, "receiver handoff evidence required")
         previous_status = canonical_task_status(row_to_dict(row))
         if previous_status not in {"in_transit", "arrived"}:
             return task_state_conflict()
@@ -5025,11 +5236,13 @@ def sign_v1_task(
             from_status=previous_status,
             to_status="signed",
             reason="task signed",
+            actor_user_id=user["user_id"],
             changed_at=timestamp,
         )
         record_audit(
             conn,
             "task.sign",
+            user_id=user["user_id"],
             resource_type="task",
             resource_id=task_id,
             task_id=task_id,
@@ -5045,8 +5258,12 @@ def reject_v1_task(
     task_id: str,
     data: RejectTaskIn,
     idempotency_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
 ):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     reason = data.reason.strip()
     if not reason:
         return api_error(400, 40001, "rejection reason required")
@@ -5060,6 +5277,32 @@ def reject_v1_task(
         row = get_task_by_id(conn, task_id)
         if not row:
             return api_error(404, 40401, "task not found")
+        task = serialize_task(row)
+        if user["role"] != "admin" and task.get("receiver_user_id") != user["user_id"]:
+            return api_error(404, 40401, "task not found")
+        if task_id != DEMO_TASK["task_id"]:
+            qr_evidence = conn.execute(
+                """
+                SELECT qr_tokens.id
+                FROM qr_tokens
+                JOIN handoffs ON handoffs.handoff_id = qr_tokens.handoff_id
+                WHERE handoffs.task_id = ?
+                  AND handoffs.handoff_type = ?
+                  AND handoffs.to_user_id = ?
+                  AND qr_tokens.status = ?
+                  AND qr_tokens.consumed_at IS NOT NULL
+                ORDER BY qr_tokens.id DESC
+                LIMIT 1
+                """,
+                (
+                    task_id,
+                    "carrier_to_receiver",
+                    task.get("receiver_user_id"),
+                    "consumed",
+                ),
+            ).fetchone()
+            if not qr_evidence:
+                return api_error(409, 40933, "receiver handoff evidence required")
         previous_status = canonical_task_status(row_to_dict(row))
         if previous_status not in {"in_transit", "arrived"}:
             return task_state_conflict()
@@ -5078,11 +5321,13 @@ def reject_v1_task(
             from_status=previous_status,
             to_status="rejected",
             reason=reason,
+            actor_user_id=user["user_id"],
             changed_at=timestamp,
         )
         record_audit(
             conn,
             "task.reject",
+            user_id=user["user_id"],
             resource_type="task",
             resource_id=task_id,
             task_id=task_id,
@@ -5095,9 +5340,18 @@ def reject_v1_task(
 
 
 @app.get("/api/v1/tasks/{task_id}/trace-report")
-def get_v1_trace_report(task_id: str):
+def get_v1_trace_report(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
+            return api_error(404, 40401, "task not found")
         report = get_trace_report_data(conn, task_id)
     if not report:
         return api_error(404, 40401, "task not found")
@@ -5105,9 +5359,18 @@ def get_v1_trace_report(task_id: str):
 
 
 @app.get("/api/v1/tasks/{task_id}/trace-report.pdf")
-def get_v1_trace_report_pdf(task_id: str):
+def get_v1_trace_report_pdf(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
     init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
     with get_connection() as conn:
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
+            return api_error(404, 40401, "task not found")
         report = get_trace_report_data(conn, task_id)
     if not report:
         return api_error(404, 40401, "task not found")
@@ -5129,7 +5392,327 @@ def get_v1_trace_report_pdf(task_id: str):
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{task_id}-trace-report.pdf"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{task_id}-trace-report.pdf"'
+        },
+    )
+
+
+@app.post("/api/v1/devices/{device_id}/bind-check")
+def check_v1_device_binding(
+    device_id: str,
+    payload: DeviceBindCheckIn,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    with get_connection() as conn:
+        device = conn.execute(
+            "SELECT * FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if device and not can_manage_device(user, row_to_dict(device)):
+            return api_error(404, 40402, "device not found")
+    occupied_task_id = device["current_task_id"] if device else None
+    return api_success(
+        {
+            "device_id": device_id,
+            "box_id": payload.box_id,
+            "seal_id": payload.seal_id,
+            "available": not occupied_task_id,
+            "occupied_task_id": occupied_task_id,
+            "checked_at": now_iso(),
+            "message": "设备可绑定" if not occupied_task_id else "设备已绑定其他运单",
+        }
+    )
+
+
+@app.get("/api/v1/devices/{device_id}/precheck")
+def precheck_v1_device(
+    device_id: str,
+    min_temp: float = Query(...),
+    max_temp: float = Query(...),
+    allow_local: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    if not require_user(authorization):
+        return api_error(401, 40102, "unauthorized")
+    hardware_telemetry = None
+    hardware_error = None
+    available_device_ids: list[str] = []
+    try:
+        snapshot = fetch_live_hardware_snapshot()
+        latest_values = (snapshot.get("latest_telemetry_by_task") or {}).values()
+        available_device_ids = sorted(
+            {
+                str(item.get("device_id"))
+                for item in latest_values
+                if item.get("device_id")
+            }
+        )
+        hardware_telemetry = next(
+            (
+                item
+                for item in (snapshot.get("latest_telemetry_by_task") or {}).values()
+                if str(item.get("device_id") or "") == str(device_id)
+            ),
+            None,
+        )
+    except RuntimeError as exc:
+        hardware_error = str(exc)
+    with get_connection() as conn:
+        local_row = conn.execute(
+            "SELECT * FROM device_data WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+            (device_id,),
+        ).fetchone()
+    selected_local_row = local_row if allow_local else None
+    if not hardware_telemetry and not selected_local_row:
+        return api_success(
+            {
+                "device_id": device_id,
+                "online": False,
+                "passed": False,
+                "temperature": None,
+                "humidity": None,
+                "box_status": None,
+                "move_status": None,
+                "reported_at": None,
+                "source": "none",
+                "available_device_ids": available_device_ids,
+                "suggested_device_id": (
+                    available_device_ids[0] if len(available_device_ids) == 1 else None
+                ),
+                "reason": (
+                    "真实硬件接口暂不可用，未使用本地测试数据"
+                    if hardware_error
+                    else "真实硬件接口在线，但设备编号没有匹配数据"
+                ),
+            }
+        )
+    telemetry = normalize_telemetry(hardware_telemetry or selected_local_row)
+    source = "hardware" if hardware_telemetry else "local"
+    reported_at = telemetry.get("timestamp") or telemetry.get("created_at")
+    age_seconds = None
+    try:
+        reported_time = datetime.fromisoformat(str(reported_at).replace("Z", "+00:00"))
+        if reported_time.tzinfo is None:
+            reported_time = reported_time.replace(tzinfo=timezone.utc)
+        age_seconds = max(
+            0,
+            int(
+                (
+                    datetime.now(timezone.utc)
+                    - reported_time.astimezone(timezone.utc)
+                ).total_seconds()
+            ),
+        )
+    except (TypeError, ValueError):
+        pass
+    fresh = age_seconds is not None and age_seconds <= PRECHECK_MAX_DATA_AGE_SECONDS
+    passed = (
+        fresh
+        and min_temp <= telemetry["temperature"] <= max_temp
+        and telemetry["box_status"] == "BOX_CLOSED"
+    )
+    if not fresh:
+        reason = (
+            f"{'真实硬件' if source == 'hardware' else '本地后端'}数据已过期"
+            + (f"（{age_seconds} 秒前）" if age_seconds is not None else "（时间无效）")
+        )
+    elif passed:
+        reason = f"{'真实硬件' if source == 'hardware' else '本地后端'}数据：温度与箱体状态合格"
+    else:
+        reason = f"{'真实硬件' if source == 'hardware' else '本地后端'}数据：请检查温度与箱体状态"
+    return api_success(
+        {
+            "device_id": device_id,
+            "online": fresh,
+            "passed": passed,
+            "temperature": telemetry["temperature"],
+            "humidity": telemetry["humidity"],
+            "box_status": telemetry["box_status"],
+            "move_status": telemetry["move_status"],
+            "reported_at": reported_at,
+            "source": source,
+            "fresh": fresh,
+            "age_seconds": age_seconds,
+            "available_device_ids": available_device_ids,
+            "suggested_device_id": None,
+            "reason": reason,
+        }
+    )
+
+
+@app.post("/api/v1/devices/{device_id}/simulate-reading")
+def simulate_v1_device_reading(
+    device_id: str,
+    payload: LocalDeviceReadingIn,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if os.environ.get("ALLOW_LOCAL_SIMULATION", "0") != "1":
+        return api_error(403, 40301, "local simulation disabled")
+    with get_connection() as conn:
+        device_row = conn.execute(
+            "SELECT current_task_id FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        target_task_id = payload.task_id or (
+            device_row["current_task_id"] if device_row else None
+        )
+        if target_task_id:
+            task_row = get_task_by_id(conn, target_task_id)
+            if not task_row or not can_view_task(user, serialize_task(task_row)):
+                return api_error(404, 40401, "task not found")
+        else:
+            target_task_id = f"LOCAL-PRECHECK-{user['user_id']}"
+        data = DeviceDataIn(
+            device_id=device_id,
+            task_id=target_task_id,
+            temperature=payload.temperature,
+            humidity=payload.humidity,
+            light_raw=120,
+            box_status="BOX_CLOSED",
+            move_status="STABLE",
+            temp_status="TEMP_OK",
+            acc_total=1.0,
+            motion_score=0.0,
+        )
+        row, _ = save_device_data(conn, data)
+    return api_success(normalize_telemetry(row), "local reading created")
+
+
+@app.post("/api/v1/face/simulate-verify")
+def simulate_v1_face(
+    payload: FaceSimulateIn,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    if os.environ.get("ALLOW_LOCAL_SIMULATION", "0") != "1":
+        return api_error(403, 40301, "local simulation disabled")
+    timestamp = now_iso()
+    with get_connection() as conn:
+        handoff = conn.execute(
+            "SELECT * FROM handoffs WHERE handoff_id = ?", (payload.handoff_id,)
+        ).fetchone()
+        if not handoff:
+            return api_error(404, 40405, "handoff not found")
+        if user["role"] != "admin" and user["user_id"] not in {
+            handoff["from_user_id"],
+            handoff["to_user_id"],
+        }:
+            return api_error(403, 40301, "forbidden")
+        verification_id = generate_verification_id()
+        conn.execute(
+            """
+            INSERT INTO face_verifications (
+                verification_id, user_id, handoff_id, liveness_passed,
+                similarity_score, threshold, verified, manual_review_required,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                verification_id,
+                user["user_id"],
+                payload.handoff_id,
+                1,
+                0.99,
+                0.8,
+                1,
+                0,
+                "verified",
+                timestamp,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM face_verifications WHERE verification_id = ?",
+            (verification_id,),
+        ).fetchone()
+    result = serialize_face_verification(row)
+    result.update(
+        {
+            "face_count": 1,
+            "quality_score": result["similarity_score"],
+            "party": (
+                "issuer"
+                if user["user_id"] == handoff["from_user_id"]
+                else "recipient"
+            ),
+        }
+    )
+    return api_success(result, "local face simulation verified")
+
+
+@app.get("/api/v1/tasks/{task_id}/hardware/snapshot")
+def get_v1_task_hardware_snapshot(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    init_db()
+    user = require_user(authorization)
+    if not user:
+        return api_error(401, 40102, "unauthorized")
+    with get_connection() as conn:
+        task_row = get_task_by_id(conn, task_id)
+        if not task_row or not can_view_task(user, serialize_task(task_row)):
+            return api_error(404, 40401, "task not found")
+        task = serialize_task(task_row)
+    try:
+        snapshot = fetch_live_hardware_snapshot()
+    except RuntimeError as exc:
+        return api_error(502, 50201, str(exc))
+    requested_device_id = str(task.get("device_id") or "")
+    latest_by_task = snapshot.get("latest_telemetry_by_task") or {}
+    latest = latest_by_task.get(task_id)
+    matched_by: Optional[str] = "task_id" if latest else None
+    if not latest and requested_device_id:
+        latest = next(
+            (
+                item
+                for item in latest_by_task.values()
+                if str(item.get("device_id") or "") == requested_device_id
+            ),
+            None,
+        )
+        if latest:
+            matched_by = "device_id"
+    history_by_task = snapshot.get("telemetry_history_by_task") or {}
+    history = history_by_task.get(task_id) or []
+    if not history and requested_device_id:
+        history = [
+            item
+            for items in history_by_task.values()
+            for item in (items or [])
+            if str(item.get("device_id") or "") == requested_device_id
+        ]
+    alarms = [
+        item
+        for item in (snapshot.get("recent_alarms") or [])
+        if str(item.get("task_id") or "") == task_id
+        or (
+            requested_device_id
+            and str(item.get("device_id") or "") == requested_device_id
+        )
+    ]
+    return api_success(
+        {
+            "source_url": LIVE_SNAPSHOT_URL,
+            "generated_at": snapshot.get("generated_at"),
+            "requested_task_id": task_id,
+            "requested_device_id": requested_device_id or None,
+            "matched": bool(latest),
+            "matched_by": matched_by,
+            "latest": normalize_telemetry(latest) if latest else None,
+            "history": [normalize_telemetry(item) for item in history[:60]],
+            "recent_alarms": alarms[:50],
+        }
     )
 
 

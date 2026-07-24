@@ -1,0 +1,14 @@
+{
+  "code": 0,
+  "message": "alarm resolved",
+  "data": {
+    "event_id": 8,
+    "task_id": "WD-20260723-001",
+    "device_id": "CLD-001",
+    "event_type": "TEMP_ALERT",
+    "alarm_status": "resolved",
+    "resolution": "温度已恢复，继续运输",
+    "acknowledged_at": "2026-07-23T10:06:00+08:00",
+    "resolved_at": "2026-07-23T10:08:00+08:00"
+  }
+}

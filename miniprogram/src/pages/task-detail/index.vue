@@ -6,7 +6,7 @@ import StatePanel from '@/components/StatePanel.vue'
 import { taskService } from '@/services/tasks'
 import { errorMessage } from '@/services/request'
 import { useSessionStore } from '@/stores/session'
-import type { Task, Telemetry } from '@/types/api'
+import type { AssignmentCandidate, Task, Telemetry } from '@/types/api'
 import { canStartTask, formatTime } from '@/utils/status'
 
 const session = useSessionStore()
@@ -15,8 +15,38 @@ const task = ref<Task | null>(null)
 const telemetry = ref<Telemetry | null>(null)
 const loading = ref(true)
 const error = ref('')
+const receivers = ref<AssignmentCandidate[]>([])
+const receiverIndex = ref(-1)
+const assigningReceiver = ref(false)
 const canStart = computed(() => task.value ? canStartTask(task.value.status) : false)
-const canAccept = computed(() => task.value ? ['in_transit', 'arrived'].includes(task.value.status) : false)
+const isAssignedReceiver = computed(() => Boolean(
+  task.value
+  && (
+    session.user?.role === 'admin'
+    || (
+      session.user?.role === 'receiver'
+      && String(task.value.receiver_user_id || '') === String(session.user?.id || '')
+    )
+  ),
+))
+const canAccept = computed(() => Boolean(task.value?.status === 'arrived' && isAssignedReceiver.value))
+const canArrivalHandoff = computed(() => Boolean(
+  task.value?.status === 'in_transit'
+  && task.value.receiver_user_id
+  && session.user?.role === 'carrier'
+  && String(task.value.carrier_user_id || '') === String(session.user?.id || ''),
+))
+const canRepairReceiver = computed(() => Boolean(
+  task.value
+  && ['in_transit', 'arrived'].includes(task.value.status)
+  && !task.value.receiver_user_id
+  && task.value.carrier_user_id
+  && (
+    session.user?.role === 'admin'
+    || String(task.value.owner_user_id || '') === String(session.user?.id || '')
+  ),
+))
+const selectedReceiver = computed(() => receivers.value[receiverIndex.value] || null)
 const canEdit = computed(() => Boolean(
   task.value
   && ['pending_pack', 'pending_handoff'].includes(task.value.status)
@@ -37,6 +67,10 @@ async function load() {
       taskService.getTask(taskId.value),
       taskService.getLatestTelemetry(taskId.value),
     ])
+    if (canRepairReceiver.value && !receivers.value.length) {
+      const result = await taskService.listCandidates('receiver')
+      receivers.value = result.items
+    }
   } catch (e) { error.value = errorMessage(e) }
   finally { loading.value = false; uni.stopPullDownRefresh() }
 }
@@ -50,7 +84,33 @@ function editTask() {
 }
 
 function openPage(page: 'monitor' | 'alarms' | 'trace' | 'acceptance') {
+  if (page === 'acceptance' && !canAccept.value) {
+    const message = !task.value?.receiver_user_id
+      ? '该运单未绑定接收方账号，请发货方先补充接收人'
+      : task.value?.status === 'in_transit'
+        ? '请先由承运人完成到达交接'
+        : '只有该运单指定接收方可以验收'
+    return uni.showToast({ title: message, icon: 'none', duration: 3000 })
+  }
   uni.navigateTo({ url: `/pages/${page}/index?task_id=${encodeURIComponent(taskId.value)}` })
+}
+
+async function assignMissingReceiver() {
+  if (!task.value || !selectedReceiver.value || assigningReceiver.value) {
+    return uni.showToast({ title: receivers.value.length ? '请选择接收账号' : '请先注册一个接收方账号', icon: 'none' })
+  }
+  assigningReceiver.value = true
+  try {
+    await taskService.assignTask(
+      task.value.task_id,
+      Number(task.value.carrier_user_id),
+      selectedReceiver.value.user_id,
+    )
+    uni.showToast({ title: '接收账号已补充', icon: 'success' })
+    await load()
+  } catch (e) {
+    uni.showToast({ title: errorMessage(e), icon: 'none', duration: 3000 })
+  } finally { assigningReceiver.value = false }
 }
 
 onLoad((query) => {
@@ -130,9 +190,19 @@ onShow(() => { if (taskId.value && !loading.value) load() })
         </view>
       </view>
 
+      <view v-if="canRepairReceiver" class="card repair-card">
+        <view class="section-title">补充接收方账号</view>
+        <view class="repair-hint">这是一张旧运单，只有接收单位文字，没有绑定可登录的接收方账号。请选择注册角色为“接收方”的人员，补充后才能完成到达交接与验收。</view>
+        <picker :range="receivers" range-key="name" :value="receiverIndex" @change="receiverIndex=Number($event.detail.value)">
+          <view class="receiver-picker">{{ selectedReceiver ? `${selectedReceiver.name} · ${selectedReceiver.organization}` : receivers.length ? '请选择接收账号' : '暂无接收账号，请先注册' }}</view>
+        </picker>
+        <button class="repair-button" :disabled="assigningReceiver || !selectedReceiver" @tap="assignMissingReceiver">{{ assigningReceiver ? '正在补充…' : '确认绑定接收账号' }}</button>
+      </view>
+
       <view v-if="canEdit" class="edit-tip">运输开始前可修改运单资料；设备编号与固定运单号保持不变。</view>
       <button v-if="canEdit" class="secondary edit-button" @tap="editTask">编辑运单资料</button>
       <button v-if="canStart" class="primary action-button" @tap="handoff">进入发出交接</button>
+      <button v-else-if="canArrivalHandoff" class="primary action-button" @tap="handoff">发起到达交接</button>
       <button v-else-if="canAccept" class="primary action-button" @tap="openPage('acceptance')">进入到达验收</button>
     </template>
   </view>
@@ -147,4 +217,5 @@ onShow(() => { if (taskId.value && !loading.value) load() })
 .workspace-grid { display:grid; grid-template-columns:1fr 1fr; gap:14rpx; }.workspace-item { padding:20rpx; border:1rpx solid #edf0f5; border-radius:20rpx; background:#f8f9fc; }.workspace-icon { display:flex; align-items:center; justify-content:center; width:48rpx; height:48rpx; margin-bottom:12rpx; border-radius:15rpx; font-size:20rpx; font-weight:750; }.workspace-icon.orange { color:#bd7720; background:#fff0dc; }.workspace-title { color:#40566e; font-size:24rpx; font-weight:690; }.workspace-desc { margin-top:4rpx; color:#99a6b6; font-size:19rpx; }
 .detail-page{background:#fbfcf9}.detail-tabs{display:flex;margin-bottom:20rpx;overflow:hidden;border:1rpx solid #dfe5da;border-radius:999rpx;background:#fff}.detail-tabs text{flex:1;padding:17rpx 4rpx;color:#6d7569;text-align:center;font-size:20rpx}.detail-tabs .active{color:#fff;border-radius:999rpx;background:linear-gradient(90deg,#79d70d,#4aad00)}.hero-card{color:#fff;border:0;background:radial-gradient(circle at 80% 20%,rgba(220,255,144,.35),transparent 260rpx),linear-gradient(135deg,#7fd20c,#48a900);box-shadow:0 15rpx 35rpx rgba(74,162,0,.2)}.accent{display:none}.hero-card .task-code,.hero-card .metric-label,.hero-card .metric-status,.hero-card .updated{color:rgba(255,255,255,.72)}.hero-card .sample-name,.hero-card .metric-value{color:#fff}.hero-card .unit,.hero-card .route-line-text,.hero-card .arrow{color:rgba(255,255,255,.85)}.hero-route{margin-top:5rpx;font-size:24rpx;opacity:.9}.refresh{color:#53ad05}.purple{color:#54ad06;background:#eff9e7}
 .edit-tip{margin:28rpx 8rpx 12rpx;color:#8c9983;font-size:21rpx;text-align:center}.edit-button{width:100%;height:78rpx;border:2rpx solid #63bd17;border-radius:20rpx;color:#55ad0b;background:#fff;font-size:25rpx;line-height:74rpx}.edit-button+.action-button{margin-top:18rpx}
+.repair-card{border-color:#f0d49b;background:#fffaf0}.repair-hint{margin:14rpx 0;color:#8c7040;font-size:21rpx;line-height:1.6}.receiver-picker{height:70rpx;padding:0 20rpx;border:1rpx solid #dfdfd5;border-radius:14rpx;color:#455a72;background:#fff;line-height:70rpx}.repair-button{height:72rpx;margin-top:16rpx;border-radius:16rpx;color:#fff;background:#58b608;font-size:23rpx;line-height:72rpx}
 </style>

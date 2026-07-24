@@ -5,7 +5,7 @@ export type TemperatureStatus = 'TEMP_OK' | 'TEMP_ALERT'
 export type UserRole = 'admin' | 'sender' | 'carrier' | 'receiver'
 
 export interface AuthUser {
-  id: string; name: string; phone: string; organization: string; role: UserRole; created_at: string
+  id?: string; user_id?: string | number; name: string; phone: string; organization: string; role: UserRole; created_at?: string
 }
 export interface AuthSession { token: string; user: AuthUser }
 export interface LoginInput { phone: string; password: string }
@@ -27,6 +27,10 @@ export interface CreateTaskInput {
   sample_name: string; batch: string; receiver: string; carrier: string; expected_arrival: string
   device_id: string; box_id: string; seal_id: string; temperature_range: string
 }
+export interface AssignmentCandidate {
+  user_id: number; name: string; display_name: string; organization: string
+  role: 'carrier' | 'receiver'; status: string
+}
 export interface Telemetry {
   id: number; device_id: string; task_id: string; temperature: number; humidity: number; light_raw: number
   box_status: BoxStatus; move_status: MoveStatus; temp_status: TemperatureStatus; acc_total: number
@@ -36,36 +40,30 @@ export interface ContractMeta {
   task_statuses: TaskStatus[]; box_statuses: BoxStatus[]; move_statuses: MoveStatus[]
   temperature_statuses: TemperatureStatus[]; timestamp_format: string; field_naming: string
 }
-
-export interface PagedResult<T> { limit: number; items: T[] }
+export interface PagedResult<T> { limit?: number; page?: number; page_size?: number; total?: number; items: T[] }
 
 export interface AlarmEvent {
   id: number; data_id: number; task_id: string; device_id: string; event_type: string
   event_name: string; event_detail: string; timestamp: string; created_at: string
 }
-
 export interface HardwareSnapshot {
   source_url: string; generated_at: string | null
   requested_task_id: string; requested_device_id: string | null
   matched: boolean; matched_by: 'task_id' | 'device_id' | null
   latest: Telemetry | null; history: Telemetry[]; recent_alarms: AlarmEvent[]
 }
-
 export interface TraceSummary {
   total_records: number; min_temperature: number | null; max_temperature: number | null
   avg_temperature: number | null; min_humidity: number | null; max_humidity: number | null
   event_count: number
 }
-
 export interface HandoffNode {
   type: 'started' | 'signed' | 'rejected'; timestamp: string; reason?: string | null
 }
-
 export interface TraceReport {
   task: Task; latest: Telemetry | null; summary: TraceSummary
   events: AlarmEvent[]; handoff_nodes: HandoffNode[]
 }
-
 export interface HandoffQr {
   handoff_id: string; token: string; expires_at: string; ttl_seconds: number
   qr_payload: string; qr_image_data_url: string | null
@@ -73,13 +71,28 @@ export interface HandoffQr {
 export interface HandoffFaceState { verified: boolean; quality_score: number; verified_at: string }
 export interface HandoffSession {
   handoff_id: string; task_id: string; action?: string; status: string
-  issuer_user_id: string | number; recipient_user_id: string | number | null; expires_at: string
-  confirmed_at: string | null; note?: string | null; qr_verified_at?: string | null
-  faces: { issuer?: HandoffFaceState; recipient?: HandoffFaceState }
+  handoff_type?: 'sender_to_carrier' | 'carrier_to_carrier' | 'carrier_to_receiver'
+  issuer_user_id?: string | number; recipient_user_id?: string | number | null
+  from_user_id?: string | number; to_user_id?: string | number | null; expires_at: string
+  created_at?: string; confirmed_at: string | null; note?: string | null; qr_verified_at?: string | null
+  faces?: { issuer?: HandoffFaceState; recipient?: HandoffFaceState }
+  from_user?: { user_id: number; name: string; organization: string; role: UserRole } | null
+  to_user?: { user_id: number; name: string; organization: string; role: UserRole } | null
+  evidence?: { qr_verified: boolean; face_status: string; face_verified: boolean; file_count: number }
 }
 export interface FaceVerification {
-  verification_id: string; party: 'issuer' | 'recipient'; verified: boolean
-  face_count: number; quality_score: number; expires_at: string
+  verification_id: string; party?: 'issuer' | 'recipient'; verified: boolean
+  face_count?: number; quality_score?: number; expires_at?: string; status?: string
+}
+export interface EvidenceFile {
+  file_id: string; task_id: string; file_name: string; file_type: string; file_size: number
+  sha256: string; usage: string; related_type?: string | null; related_id?: string | null
+  download_url?: string
+}
+export interface DashboardSummary {
+  active_tasks: number; abnormal_tasks: number; online_devices: number; offline_devices: number
+  today_alarm_count: number; status_distribution: Record<string, number>
+  alarm_distribution: Record<string, number>; updated_at: string
 }
 export interface DevicePrecheck {
   device_id: string; online: boolean; passed: boolean; temperature: number | null
